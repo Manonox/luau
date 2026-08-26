@@ -3,7 +3,7 @@
 
 #include "Luau/TypeArena.h"
 #include "Luau/TypeFwd.h"
-#include "Luau/DenseHash.h"
+#include "Luau/DenseHash2.h"
 
 // We provide an implementation of substitution on types,
 // which recursively replaces types by other types.
@@ -66,6 +66,13 @@ struct TarjanWorklistVertex
     int index;
     int currEdge;
     int lastEdge;
+
+    TarjanWorklistVertex(int index, int currEdge, int lastEdge)
+        : index(index)
+        , currEdge(currEdge)
+        , lastEdge(lastEdge)
+    {
+    }
 };
 
 struct TarjanNode
@@ -79,6 +86,15 @@ struct TarjanNode
     // Tarjan calculates the lowlink for each vertex,
     // which is the lowest ancestor index reachable from the vertex.
     int lowlink;
+
+    TarjanNode(TypeId ty, TypePackId tp, bool onStack, bool dirty, int lowlink)
+        : ty(ty)
+        , tp(tp)
+        , onStack(onStack)
+        , dirty(dirty)
+        , lowlink(lowlink)
+    {
+    }
 };
 
 // Tarjan's algorithm for finding the SCCs in a cyclic structure.
@@ -86,10 +102,11 @@ struct TarjanNode
 struct Tarjan
 {
     Tarjan();
+    virtual ~Tarjan() = default;
 
     // Vertices (types and type packs) are indexed, using pre-order traversal.
-    DenseHashMap<TypeId, int> typeToIndex{nullptr};
-    DenseHashMap<TypePackId, int> packToIndex{nullptr};
+    DenseHashMap2<TypeId, int> typeToIndex;
+    DenseHashMap2<TypePackId, int> packToIndex;
 
     std::vector<TarjanNode> nodes;
 
@@ -121,7 +138,7 @@ struct Tarjan
     void visitChildren(TypePackId tp, int index);
 
     void visitChild(TypeId ty);
-    void visitChild(TypePackId ty);
+    void visitChild(TypePackId tp);
 
     template<typename Ty>
     void visitChild(std::optional<Ty> ty)
@@ -132,7 +149,7 @@ struct Tarjan
 
     // Visit the root vertex.
     TarjanResult visitRoot(TypeId ty);
-    TarjanResult visitRoot(TypePackId ty);
+    TarjanResult visitRoot(TypePackId tp);
 
     // Used to reuse the object for a new operation
     void clearTarjan(const TxnLog* log);
@@ -150,26 +167,12 @@ struct Tarjan
     void visitSCC(int index);
 
     // Each subclass can decide to ignore some nodes.
-    virtual bool ignoreChildren(TypeId ty)
-    {
-        return false;
-    }
-
-    virtual bool ignoreChildren(TypePackId ty)
-    {
-        return false;
-    }
+    virtual bool ignoreChildren(TypeId ty);
+    virtual bool ignoreChildren(TypePackId ty);
 
     // Some subclasses might ignore children visit, but not other actions like replacing the children
-    virtual bool ignoreChildrenVisit(TypeId ty)
-    {
-        return ignoreChildren(ty);
-    }
-
-    virtual bool ignoreChildrenVisit(TypePackId ty)
-    {
-        return ignoreChildren(ty);
-    }
+    virtual bool ignoreChildrenVisit(TypeId ty);
+    virtual bool ignoreChildrenVisit(TypePackId ty);
 
     // Subclasses should say which vertices are dirty,
     // and what to do with dirty vertices.
@@ -184,6 +187,7 @@ struct Tarjan
 struct Substitution : Tarjan
 {
 protected:
+    explicit Substitution(TypeArena* arena);
     Substitution(const TxnLog* log_, TypeArena* arena);
 
     /*
@@ -202,13 +206,13 @@ protected:
 
 public:
     TypeArena* arena;
-    DenseHashMap<TypeId, TypeId> newTypes{nullptr};
-    DenseHashMap<TypePackId, TypePackId> newPacks{nullptr};
-    DenseHashSet<TypeId> replacedTypes{nullptr};
-    DenseHashSet<TypePackId> replacedTypePacks{nullptr};
+    DenseHashMap2<TypeId, TypeId> newTypes;
+    DenseHashMap2<TypePackId, TypePackId> newPacks;
+    DenseHashSet2<TypeId> replacedTypes;
+    DenseHashSet2<TypePackId> replacedTypePacks;
 
-    DenseHashSet<TypeId> noTraverseTypes{nullptr};
-    DenseHashSet<TypePackId> noTraverseTypePacks{nullptr};
+    DenseHashSet2<TypeId> noTraverseTypes;
+    DenseHashSet2<TypePackId> noTraverseTypePacks;
 
     std::optional<TypeId> substitute(TypeId ty);
     std::optional<TypePackId> substitute(TypePackId tp);
@@ -232,28 +236,23 @@ public:
     virtual TypeId clean(TypeId ty) = 0;
     virtual TypePackId clean(TypePackId tp) = 0;
 
+protected:
     // Helper functions to create new types (used by subclasses)
     template<typename T>
-    TypeId addType(const T& tv)
+    TypeId addType(T tv)
     {
-        return arena->addType(tv);
+        return arena->addType(std::move(tv));
     }
 
     template<typename T>
-    TypePackId addTypePack(const T& tp)
+    TypePackId addTypePack(T tp)
     {
-        return arena->addTypePack(TypePackVar{tp});
+        return arena->addTypePack(TypePackVar{std::move(tp)});
     }
 
 private:
     template<typename Ty>
-    std::optional<Ty> replace(std::optional<Ty> ty)
-    {
-        if (ty)
-            return replace(*ty);
-        else
-            return std::nullopt;
-    }
+    std::optional<Ty> replace(std::optional<Ty> ty);
 };
 
 } // namespace Luau

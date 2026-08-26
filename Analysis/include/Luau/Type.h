@@ -5,10 +5,11 @@
 
 #include "Luau/Ast.h"
 #include "Luau/Common.h"
-#include "Luau/Refinement.h"
-#include "Luau/DenseHash.h"
+#include "Luau/DenseHash2.h"
 #include "Luau/NotNull.h"
+#include "Luau/Polarity.h"
 #include "Luau/Predicate.h"
+#include "Luau/Refinement.h"
 #include "Luau/Unifiable.h"
 #include "Luau/Variant.h"
 #include "Luau/VecDeque.h"
@@ -19,7 +20,6 @@
 #include <optional>
 #include <set>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 LUAU_FASTINT(LuauTableTypeMaximumStringifierLength)
@@ -31,9 +31,20 @@ namespace Luau
 struct TypeArena;
 struct Scope;
 using ScopePtr = std::shared_ptr<Scope>;
+struct Module;
 
 struct TypeFunction;
+struct TypeFun;
 struct Constraint;
+struct Subtyping;
+struct TypeChecker2;
+struct BuiltinTypeFunctions;
+
+enum struct SolverMode
+{
+    Old,
+    New
+};
 
 /**
  * There are three kinds of type variables:
@@ -66,11 +77,11 @@ using Name = std::string;
 // A free type is one whose exact shape has yet to be fully determined.
 struct FreeType
 {
-    explicit FreeType(TypeLevel level);
-    explicit FreeType(Scope* scope);
-    FreeType(Scope* scope, TypeLevel level);
-
-    FreeType(Scope* scope, TypeId lowerBound, TypeId upperBound);
+    // New constructors
+    explicit FreeType(TypeLevel level, TypeId lowerBound, TypeId upperBound);
+    // This one got promoted to explicit
+    explicit FreeType(Scope* scope, TypeId lowerBound, TypeId upperBound, Polarity polarity = Polarity::Unknown);
+    explicit FreeType(Scope* scope, TypeLevel level, TypeId lowerBound, TypeId upperBound);
 
     int index;
     TypeLevel level;
@@ -84,6 +95,13 @@ struct FreeType
     // Only used under local type inference
     TypeId lowerBound = nullptr;
     TypeId upperBound = nullptr;
+
+    Polarity polarity = Polarity::Unknown;
+
+    // If set, this free type was created for a primitive literal (string or boolean).
+    // When generalized, it will be resolved to its lower-bound singleton if the upper
+    // bound was narrowed, or to this primitive type otherwise.
+    std::optional<TypeId> primitiveType;
 };
 
 struct GenericType
@@ -92,17 +110,21 @@ struct GenericType
     GenericType();
 
     explicit GenericType(TypeLevel level);
-    explicit GenericType(const Name& name);
-    explicit GenericType(Scope* scope);
+    explicit GenericType(const Name& name, Polarity polarity);
+    explicit GenericType(Scope* scope, Polarity polarity);
 
     GenericType(TypeLevel level, const Name& name);
     GenericType(Scope* scope, const Name& name);
+
+    GenericType(Scope* scope, Name name, Polarity polarity);
 
     int index;
     TypeLevel level;
     Scope* scope = nullptr;
     Name name;
     bool explicitName = false;
+
+    Polarity polarity = Polarity::Unknown;
 };
 
 // When an equality constraint is found, it is then "bound" to that type,
@@ -128,14 +150,14 @@ struct BlockedType
     BlockedType();
     int index;
 
-    Constraint* getOwner() const;
-    void setOwner(Constraint* newOwner);
-    void replaceOwner(Constraint* newOwner);
+    const Constraint* getOwner() const;
+    void setOwner(const Constraint* newOwner);
+    void replaceOwner(const Constraint* newOwner);
 
 private:
     // The constraint that is intended to unblock this type. Other constraints
     // should block on this constraint if present.
-    Constraint* owner = nullptr;
+    const Constraint* owner = nullptr;
 };
 
 struct PrimitiveType
@@ -145,6 +167,7 @@ struct PrimitiveType
         NilType, // ObjC #defines Nil :(
         Boolean,
         Number,
+        Integer,
         String,
         Thread,
         Function,
@@ -200,7 +223,7 @@ struct StringSingleton
     }
 };
 
-// No type for float singletons, partly because === isn't any equalivalence on floats
+// No type for float singletons, partly because === isn't any equivalence on floats
 // (NaN != NaN).
 
 using SingletonVariant = Luau::Variant<BooleanSingleton, StringSingleton>;
@@ -276,19 +299,14 @@ struct WithPredicate
     }
 };
 
-using MagicFunction = std::function<std::optional<
-    WithPredicate<TypePackId>>(struct TypeChecker&, const std::shared_ptr<struct Scope>&, const class AstExprCall&, WithPredicate<TypePackId>)>;
-
 struct MagicFunctionCallContext
 {
     NotNull<struct ConstraintSolver> solver;
     NotNull<const Constraint> constraint;
-    const class AstExprCall* callSite;
+    NotNull<const AstExprCall> callSite;
     TypePackId arguments;
     TypePackId result;
 };
-
-using DcrMagicFunction = std::function<bool(MagicFunctionCallContext)>;
 
 struct MagicRefinementContext
 {
@@ -297,7 +315,42 @@ struct MagicRefinementContext
     std::vector<std::optional<TypeId>> discriminantTypes;
 };
 
-using DcrMagicRefinement = void (*)(const MagicRefinementContext&);
+struct MagicFunctionTypeCheckContext
+{
+    NotNull<TypeChecker2> typechecker;
+    NotNull<BuiltinTypes> builtinTypes;
+    const class AstExprCall* callSite;
+    TypePackId arguments;
+    NotNull<Scope> checkScope;
+};
+
+struct MagicFunction
+{
+    virtual std::optional<WithPredicate<TypePackId>> handleOldSolver(
+        struct TypeChecker&,
+        const std::shared_ptr<struct Scope>&,
+        const class AstExprCall&,
+        WithPredicate<TypePackId>
+    ) = 0;
+
+    // Callback to allow custom typechecking of builtin function calls whose argument types
+    // will only be resolved after constraint solving. For example, the arguments to string.format
+    // have types that can only be decided after parsing the format string and unifying
+    // with the passed in values, but the correctness of the call can only be decided after
+    // all the types have been finalized.
+    virtual bool infer(const MagicFunctionCallContext&) = 0;
+    virtual void refine(const MagicRefinementContext&) {}
+
+    // If a magic function needs to do its own special typechecking, do it here.
+    // Returns true if magic typechecking was performed.  Return false if the
+    // default typechecking logic should run.
+    virtual bool typeCheck(const MagicFunctionTypeCheckContext&)
+    {
+        return false;
+    }
+
+    virtual ~MagicFunction() {}
+};
 
 struct FunctionType
 {
@@ -316,28 +369,10 @@ struct FunctionType
 
     // Local monomorphic function
     FunctionType(TypeLevel level, TypePackId argTypes, TypePackId retTypes, std::optional<FunctionDefinition> defn = {}, bool hasSelf = false);
-    FunctionType(
-        TypeLevel level,
-        Scope* scope,
-        TypePackId argTypes,
-        TypePackId retTypes,
-        std::optional<FunctionDefinition> defn = {},
-        bool hasSelf = false
-    );
 
     // Local polymorphic function
     FunctionType(
         TypeLevel level,
-        std::vector<TypeId> generics,
-        std::vector<TypePackId> genericPacks,
-        TypePackId argTypes,
-        TypePackId retTypes,
-        std::optional<FunctionDefinition> defn = {},
-        bool hasSelf = false
-    );
-    FunctionType(
-        TypeLevel level,
-        Scope* scope,
         std::vector<TypeId> generics,
         std::vector<TypePackId> genericPacks,
         TypePackId argTypes,
@@ -353,17 +388,17 @@ struct FunctionType
     std::vector<std::optional<FunctionArgument>> argNames;
     Tags tags;
     TypeLevel level;
-    Scope* scope = nullptr;
     TypePackId argTypes;
     TypePackId retTypes;
-    MagicFunction magicFunction = nullptr;
-    DcrMagicFunction dcrMagicFunction = nullptr;
-    DcrMagicRefinement dcrMagicRefinement = nullptr;
+    std::shared_ptr<MagicFunction> magic = nullptr;
+
     bool hasSelf;
     // `hasNoFreeOrGenericTypes` should be true if and only if the type does not have any free or generic types present inside it.
     // this flag is used as an optimization to exit early from procedures that manipulate free or generic types.
     bool hasNoFreeOrGenericTypes = false;
     bool isCheckedFunction = false;
+    bool isDeprecatedFunction = false;
+    std::shared_ptr<AstAttr::DeprecatedInfo> deprecatedInfo;
 };
 
 enum class TableState
@@ -384,14 +419,16 @@ enum class TableState
 
 struct TableIndexer
 {
-    TableIndexer(TypeId indexType, TypeId indexResultType)
+    TableIndexer(TypeId indexType, TypeId indexResultType, bool isReadOnly = false)
         : indexType(indexType)
         , indexResultType(indexResultType)
+        , isReadOnly(isReadOnly)
     {
     }
 
     TypeId indexType;
     TypeId indexResultType;
+    bool isReadOnly = false;
 };
 
 struct Property
@@ -435,12 +472,13 @@ struct Property
         std::optional<Location> typeLocation = std::nullopt
     );
 
-    // DEPRECATED: Should only be called in non-RWP! We assert that the `readTy` is not nullopt.
-    // TODO: Kill once we don't have non-RWP.
-    TypeId type() const;
+    // DEPRECATED: This should be removed with `LuauTypeSolverV2` clean up
+    TypeId type_DEPRECATED() const;
     void setType(TypeId ty);
 
-    // Sets the write type of this property to the read type.
+    // If this property has a present `writeTy`, set it equal to the `readTy`.
+    // This is to ensure that if we normalize a property that has divergent
+    // read and write types, we make them converge (for now).
     void makeShared();
 
     bool isShared() const;
@@ -485,9 +523,6 @@ struct TableType
     std::optional<TypeId> boundTo;
     Tags tags;
 
-    // Methods of this table that have an untyped self will use the same shared self type.
-    std::optional<TypeId> selfTy;
-
     // We track the number of as-yet-unadded properties to unsealed tables.
     // Some constraints will use this information to decide whether or not they
     // are able to dispatch.
@@ -513,15 +548,27 @@ struct ClassUserData
     virtual ~ClassUserData() {}
 };
 
-/** The type of a class.
+struct Obj
+{
+    TypeId ty;
+};
+
+struct Klass
+{
+    TypeId ty;
+};
+
+using NominalRelation = Variant<Obj, Klass>;
+
+/** The type of an external userdata exposed to Luau.
  *
- * Classes behave like tables in many ways, but there are some important differences:
+ * Extern types behave like tables in many ways, but there are some important differences:
  *
  * The properties of a class are always exactly known.
- * Classes optionally have a parent class.
- * Two different classes that share the same properties are nevertheless distinct and mutually incompatible.
+ * Extern types optionally have a parent type.
+ * Two different extern types that share the same properties are nevertheless distinct and mutually incompatible.
  */
-struct ClassType
+struct ExternType
 {
     using Props = TableType::Props;
 
@@ -534,8 +581,15 @@ struct ClassType
     ModuleName definitionModuleName;
     std::optional<Location> definitionLocation;
     std::optional<TableIndexer> indexer;
+    /* This field represents a bidirectional relationship between classes and object types
+       Given a Class, this relation should be a Obj in the variant, representing an instantiation of the class
+       Given a Object, this relation should be a Klass in the variant, representing the class prototype
+       Other sources of Extern Types will not have this relation set - this is for the classes fixture so that
+       we can go between class and object easily, given just the extern type
+     */
+    std::optional<NominalRelation> relation;
 
-    ClassType(
+    ExternType(
         Name name,
         Props props,
         std::optional<TypeId> parent,
@@ -545,18 +599,18 @@ struct ClassType
         ModuleName definitionModuleName,
         std::optional<Location> definitionLocation
     )
-        : name(name)
-        , props(props)
+        : name(std::move(name))
+        , props(std::move(props))
         , parent(parent)
         , metatable(metatable)
-        , tags(tags)
-        , userData(userData)
-        , definitionModuleName(definitionModuleName)
+        , tags(std::move(tags))
+        , userData(std::move(userData))
+        , definitionModuleName(std::move(definitionModuleName))
         , definitionLocation(definitionLocation)
     {
     }
 
-    ClassType(
+    ExternType(
         Name name,
         Props props,
         std::optional<TypeId> parent,
@@ -567,17 +621,45 @@ struct ClassType
         std::optional<Location> definitionLocation,
         std::optional<TableIndexer> indexer
     )
-        : name(name)
-        , props(props)
+        : name(std::move(name))
+        , props(std::move(props))
         , parent(parent)
         , metatable(metatable)
-        , tags(tags)
-        , userData(userData)
-        , definitionModuleName(definitionModuleName)
+        , tags(std::move(tags))
+        , userData(std::move(userData))
+        , definitionModuleName(std::move(definitionModuleName))
         , definitionLocation(definitionLocation)
         , indexer(indexer)
     {
     }
+};
+
+// Data required to initialize a user-defined function and its environment
+struct UserDefinedFunctionData
+{
+    // Store a weak module reference to ensure the lifetime requirements are preserved
+    std::weak_ptr<Module> owner;
+
+    // References to AST elements are owned by the Module allocator which also stores this type
+    AstStatTypeFunction* definition = nullptr;
+
+    DenseHashMap2<Name, std::pair<AstStatTypeFunction*, size_t>> environmentFunction;
+    DenseHashMap2<Name, std::pair<TypeFun*, size_t>> environmentAlias;
+};
+
+enum struct TypeFunctionInstanceState
+{
+    // Indicates that further reduction might be possible.
+    Unsolved,
+
+    // Further reduction is not possible because one of the parameters is generic.
+    Solved,
+
+    // Further reduction is not possible because the application is undefined.
+    // This always indicates an error in the code.
+    //
+    // eg add<nil, nil>
+    Stuck,
 };
 
 /**
@@ -594,24 +676,44 @@ struct TypeFunctionInstanceType
     std::vector<TypeId> typeArguments;
     std::vector<TypePackId> packArguments;
 
-    TypeFunctionInstanceType(NotNull<const TypeFunction> function, std::vector<TypeId> typeArguments, std::vector<TypePackId> packArguments)
+    std::optional<AstName> userFuncName; // Name of the user-defined type function; only available for UDTFs
+    UserDefinedFunctionData userFuncData;
+
+    TypeFunctionInstanceState state = TypeFunctionInstanceState::Unsolved;
+
+    TypeFunctionInstanceType(
+        NotNull<const TypeFunction> function,
+        std::vector<TypeId> typeArguments,
+        std::vector<TypePackId> packArguments,
+        std::optional<AstName> userFuncName,
+        UserDefinedFunctionData userFuncData
+    )
         : function(function)
-        , typeArguments(typeArguments)
-        , packArguments(packArguments)
+        , typeArguments(std::move(typeArguments))
+        , packArguments(std::move(packArguments))
+        , userFuncName(userFuncName)
+        , userFuncData(std::move(userFuncData))
     {
     }
 
     TypeFunctionInstanceType(const TypeFunction& function, std::vector<TypeId> typeArguments)
         : function{&function}
-        , typeArguments(typeArguments)
+        , typeArguments(std::move(typeArguments))
         , packArguments{}
     {
     }
 
     TypeFunctionInstanceType(const TypeFunction& function, std::vector<TypeId> typeArguments, std::vector<TypePackId> packArguments)
         : function{&function}
-        , typeArguments(typeArguments)
-        , packArguments(packArguments)
+        , typeArguments(std::move(typeArguments))
+        , packArguments(std::move(packArguments))
+    {
+    }
+
+    TypeFunctionInstanceType(NotNull<const TypeFunction> function, std::vector<TypeId> typeArguments, std::vector<TypePackId> packArguments)
+        : function{function}
+        , typeArguments(std::move(typeArguments))
+        , packArguments(std::move(packArguments))
     {
     }
 };
@@ -641,6 +743,11 @@ struct AnyType
 {
 };
 
+// A special, trivial type for the refinement system that is always eliminated from intersections.
+struct NoRefineType
+{
+};
+
 // `T | U`
 struct UnionType
 {
@@ -657,7 +764,7 @@ struct LazyType
 {
     LazyType() = default;
     LazyType(std::function<void(LazyType&)> unwrap)
-        : unwrap(unwrap)
+        : unwrap(std::move(unwrap))
     {
     }
 
@@ -708,7 +815,7 @@ struct NegationType
     TypeId ty;
 };
 
-using ErrorType = Unifiable::Error;
+using ErrorType = Unifiable::Error<TypeId>;
 
 using TypeVariant = Unifiable::Variant<
     TypeId,
@@ -721,7 +828,7 @@ using TypeVariant = Unifiable::Variant<
     FunctionType,
     TableType,
     MetatableType,
-    ClassType,
+    ExternType,
     AnyType,
     UnionType,
     IntersectionType,
@@ -729,6 +836,7 @@ using TypeVariant = Unifiable::Variant<
     UnknownType,
     NeverType,
     NegationType,
+    NoRefineType,
     TypeFunctionInstanceType>;
 
 struct Type final
@@ -743,13 +851,13 @@ struct Type final
     {
     }
 
-    Type(const TypeVariant& ty, bool persistent)
-        : ty(ty)
+    Type(TypeVariant ty, bool persistent)
+        : ty(std::move(ty))
         , persistent(persistent)
     {
     }
 
-    // Re-assignes the content of the type, but doesn't change the owning arena and can't make type persistent.
+    // Re-assigns the content of the type, but doesn't change the owning arena and can't make type persistent.
     void reassign(const Type& rhs)
     {
         ty = rhs.ty;
@@ -774,6 +882,13 @@ struct Type final
     Type& operator=(const TypeVariant& rhs);
     Type& operator=(TypeVariant&& rhs);
 
+    Type(Type&&) = default;
+    Type& operator=(Type&&) = default;
+
+    Type clone() const;
+
+private:
+    Type(const Type&) = default;
     Type& operator=(const Type& rhs);
 };
 
@@ -806,6 +921,9 @@ struct TypeFun
      */
     TypeId type;
 
+    // The location of where this TypeFun was defined, if available
+    std::optional<Location> definitionLocation;
+
     TypeFun() = default;
 
     explicit TypeFun(TypeId ty)
@@ -813,24 +931,28 @@ struct TypeFun
     {
     }
 
-    TypeFun(std::vector<GenericTypeDefinition> typeParams, TypeId type)
+    TypeFun(std::vector<GenericTypeDefinition> typeParams, TypeId type, std::optional<Location> definitionLocation = std::nullopt)
         : typeParams(std::move(typeParams))
         , type(type)
+        , definitionLocation(definitionLocation)
     {
     }
 
-    TypeFun(std::vector<GenericTypeDefinition> typeParams, std::vector<GenericTypePackDefinition> typePackParams, TypeId type)
+    TypeFun(
+        std::vector<GenericTypeDefinition> typeParams,
+        std::vector<GenericTypePackDefinition> typePackParams,
+        TypeId type,
+        std::optional<Location> definitionLocation = std::nullopt
+    )
         : typeParams(std::move(typeParams))
         , typePackParams(std::move(typePackParams))
         , type(type)
+        , definitionLocation(definitionLocation)
     {
     }
 
     bool operator==(const TypeFun& rhs) const;
 };
-
-using SeenSet = std::set<std::pair<const void*, const void*>>;
-bool areEqual(SeenSet& seen, const Type& lhs, const Type& rhs);
 
 enum class FollowOption
 {
@@ -850,6 +972,7 @@ bool isPrim(TypeId ty, PrimitiveType::Type primType);
 bool isNil(TypeId ty);
 bool isBoolean(TypeId ty);
 bool isNumber(TypeId ty);
+bool isInteger(TypeId ty);
 bool isString(TypeId ty);
 bool isThread(TypeId ty);
 bool isBuffer(TypeId ty);
@@ -885,7 +1008,7 @@ bool maybeGeneric(const TypeId ty);
 bool maybeSingleton(TypeId ty);
 
 // Checks if the length operator can be applied on the value of type
-bool hasLength(TypeId ty, DenseHashSet<TypeId>& seen, int* recursionCount);
+bool hasLength(TypeId ty, DenseHashSet2<TypeId>& seen, int* recursionCount);
 
 struct BuiltinTypes
 {
@@ -896,10 +1019,8 @@ struct BuiltinTypes
 
     TypeId errorRecoveryType(TypeId guess) const;
     TypePackId errorRecoveryTypePack(TypePackId guess) const;
-    TypeId errorRecoveryType() const;
-    TypePackId errorRecoveryTypePack() const;
 
-    friend TypeId makeStringMetatable(NotNull<BuiltinTypes> builtinTypes);
+    friend TypeId makeStringMetatable(NotNull<BuiltinTypes> builtinTypes, SolverMode mode);
     friend struct GlobalTypes;
 
 private:
@@ -907,13 +1028,17 @@ private:
     bool debugFreezeArena = false;
 
 public:
+    std::unique_ptr<BuiltinTypeFunctions> typeFunctions;
     const TypeId nilType;
     const TypeId numberType;
+    const TypeId integerType;
     const TypeId stringType;
     const TypeId booleanType;
     const TypeId threadType;
     const TypeId bufferType;
     const TypeId functionType;
+    const TypeId externType;
+    const TypeId objectType;
     const TypeId classType;
     const TypeId tableType;
     const TypeId emptyTableType;
@@ -923,8 +1048,10 @@ public:
     const TypeId unknownType;
     const TypeId neverType;
     const TypeId errorType;
+    const TypeId noRefineType;
     const TypeId falsyType;
     const TypeId truthyType;
+    const TypeId notNilType;
 
     const TypeId optionalNumberType;
     const TypeId optionalStringType;
@@ -945,10 +1072,10 @@ TypeLevel* getMutableLevel(TypeId ty);
 
 std::optional<TypeLevel> getLevel(TypePackId tp);
 
-const Property* lookupClassProp(const ClassType* cls, const Name& name);
+const Property* lookupExternTypeProp(const ExternType* cls, const Name& name);
 
 // Whether `cls` is a subclass of `parent`
-bool isSubclass(const ClassType* cls, const ClassType* parent);
+bool isSubclass(const ExternType* cls, const ExternType* parent);
 
 Type* asMutable(TypeId ty);
 
@@ -1082,7 +1209,7 @@ private:
     using SavedIterInfo = std::pair<const T*, size_t>;
 
     VecDeque<SavedIterInfo> stack;
-    DenseHashSet<const T*> seen{nullptr}; // Only needed to protect the iterator from hanging the thread.
+    DenseHashSet2<const T*> seen; // Only needed to protect the iterator from hanging the thread.
 
     void advance()
     {
@@ -1125,10 +1252,14 @@ private:
     }
 };
 
-TypeId freshType(NotNull<TypeArena> arena, NotNull<BuiltinTypes> builtinTypes, Scope* scope);
+TypeId freshType(NotNull<TypeArena> arena, NotNull<BuiltinTypes> builtinTypes, Scope* scope, Polarity polarity = Polarity::Unknown);
 
 using TypeIdPredicate = std::function<std::optional<TypeId>(TypeId)>;
 std::vector<TypeId> filterMap(TypeId type, TypeIdPredicate predicate);
+
+// A tag to mark a type which doesn't derive directly from the root type as overriding the return of `typeof`.
+// Any classes which derive from this type will have typeof return this type.
+inline constexpr char kTypeofRootTag[] = "typeofRoot";
 
 void attachTag(TypeId ty, const std::string& tagName);
 void attachTag(Property& prop, const std::string& tagName);

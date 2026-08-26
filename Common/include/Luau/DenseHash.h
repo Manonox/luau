@@ -1,31 +1,21 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 #pragma once
 
+#include "Luau/HashUtil.h"
 #include "Luau/Common.h"
 
 #include <stddef.h>
 #include <functional>
-#include <utility>
 #include <type_traits>
+#include <utility>
 #include <stdint.h>
 
 namespace Luau
 {
 
-struct DenseHashPointer
-{
-    size_t operator()(const void* key) const
-    {
-        return (uintptr_t(key) >> 4) ^ (uintptr_t(key) >> 9);
-    }
-};
-
 // Internal implementation of DenseHashSet and DenseHashMap
 namespace detail
 {
-
-template<typename T>
-using DenseHashDefault = std::conditional_t<std::is_pointer_v<T>, DenseHashPointer, std::hash<T>>;
 
 template<typename Key, typename Item, typename MutableItem, typename ItemInterface, typename Hash, typename Eq>
 class DenseHashTable
@@ -490,6 +480,13 @@ public:
     typedef typename Impl::const_iterator const_iterator;
     typedef typename Impl::iterator iterator;
 
+    template<typename K = Key, std::enable_if_t<std::is_pointer_v<K>, int> = 0>
+    explicit DenseHashSet(const Key& empty_key = nullptr, size_t buckets = 0)
+        : impl(empty_key, buckets)
+    {
+    }
+
+    template<typename K = Key, std::enable_if_t<!std::is_pointer_v<K>, int> = 0>
     explicit DenseHashSet(const Key& empty_key, size_t buckets = 0)
         : impl(empty_key, buckets)
     {
@@ -578,6 +575,13 @@ public:
     typedef typename Impl::const_iterator const_iterator;
     typedef typename Impl::iterator iterator;
 
+    template<typename K = Key, std::enable_if_t<std::is_pointer_v<K>, int> = 0>
+    explicit DenseHashMap(const Key& empty_key = nullptr, size_t buckets = 0)
+        : impl(empty_key, buckets)
+    {
+    }
+
+    template<typename K = Key, std::enable_if_t<!std::is_pointer_v<K>, int> = 0>
     explicit DenseHashMap(const Key& empty_key, size_t buckets = 0)
         : impl(empty_key, buckets)
     {
@@ -628,6 +632,22 @@ public:
 
         if (fresh)
             slot->second = value;
+
+        return std::make_pair(std::ref(slot->second), fresh);
+    }
+
+    std::pair<Value&, bool> try_insert(const Key& key, Value&& value)
+    {
+        impl.rehash_if_full(key);
+
+        size_t before = impl.size();
+        std::pair<Key, Value>* slot = impl.insert_unsafe(key);
+
+        // Value is fresh if container count has increased
+        bool fresh = impl.size() > before;
+
+        if (fresh)
+            slot->second = std::move(value);
 
         return std::make_pair(std::ref(slot->second), fresh);
     }

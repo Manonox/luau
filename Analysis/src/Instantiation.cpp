@@ -1,6 +1,7 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/Instantiation.h"
 
+#include "Luau/Clone.h"
 #include "Luau/Common.h"
 #include "Luau/Instantiation2.h" // including for `Replacer` which was stolen since it will be kept in the new solver
 #include "Luau/ToString.h"
@@ -10,16 +11,11 @@
 
 #include <algorithm>
 
-LUAU_FASTFLAG(DebugLuauDeferredConstraintResolution)
-LUAU_FASTFLAG(LuauReusableSubstitutions)
-
 namespace Luau
 {
 
 void Instantiation::resetState(const TxnLog* log, TypeArena* arena, NotNull<BuiltinTypes> builtinTypes, TypeLevel level, Scope* scope)
 {
-    LUAU_ASSERT(FFlag::LuauReusableSubstitutions);
-
     Substitution::resetState(log, arena);
 
     this->builtinTypes = builtinTypes;
@@ -52,7 +48,7 @@ bool Instantiation::ignoreChildren(TypeId ty)
 {
     if (log->getMutable<FunctionType>(ty))
         return true;
-    else if (get<ClassType>(ty))
+    else if (get<ExternType>(ty))
         return true;
     else
         return false;
@@ -63,34 +59,21 @@ TypeId Instantiation::clean(TypeId ty)
     const FunctionType* ftv = log->getMutable<FunctionType>(ty);
     LUAU_ASSERT(ftv);
 
-    FunctionType clone = FunctionType{level, scope, ftv->argTypes, ftv->retTypes, ftv->definition, ftv->hasSelf};
-    clone.magicFunction = ftv->magicFunction;
-    clone.dcrMagicFunction = ftv->dcrMagicFunction;
-    clone.dcrMagicRefinement = ftv->dcrMagicRefinement;
+    FunctionType clone = FunctionType{level, ftv->argTypes, ftv->retTypes, ftv->definition, ftv->hasSelf};
+    clone.magic = ftv->magic;
     clone.tags = ftv->tags;
     clone.argNames = ftv->argNames;
+    clone.isDeprecatedFunction = ftv->isDeprecatedFunction;
+    clone.deprecatedInfo = ftv->deprecatedInfo;
     TypeId result = addType(std::move(clone));
 
-    if (FFlag::LuauReusableSubstitutions)
-    {
-        // Annoyingly, we have to do this even if there are no generics,
-        // to replace any generic tables.
-        reusableReplaceGenerics.resetState(log, arena, builtinTypes, level, scope, ftv->generics, ftv->genericPacks);
+    // Annoyingly, we have to do this even if there are no generics,
+    // to replace any generic tables.
+    reusableReplaceGenerics.resetState(log, arena, builtinTypes, level, scope, ftv->generics, ftv->genericPacks);
 
-        // TODO: What to do if this returns nullopt?
-        // We don't have access to the error-reporting machinery
-        result = reusableReplaceGenerics.substitute(result).value_or(result);
-    }
-    else
-    {
-        // Annoyingly, we have to do this even if there are no generics,
-        // to replace any generic tables.
-        ReplaceGenerics replaceGenerics{log, arena, builtinTypes, level, scope, ftv->generics, ftv->genericPacks};
-
-        // TODO: What to do if this returns nullopt?
-        // We don't have access to the error-reporting machinery
-        result = replaceGenerics.substitute(result).value_or(result);
-    }
+    // TODO: What to do if this returns nullopt?
+    // We don't have access to the error-reporting machinery
+    result = reusableReplaceGenerics.substitute(result).value_or(result);
 
     asMutable(result)->documentationSymbol = ty->documentationSymbol;
     return result;
@@ -112,8 +95,6 @@ void ReplaceGenerics::resetState(
     const std::vector<TypePackId>& genericPacks
 )
 {
-    LUAU_ASSERT(FFlag::LuauReusableSubstitutions);
-
     Substitution::resetState(log, arena);
 
     this->builtinTypes = builtinTypes;
@@ -139,7 +120,7 @@ bool ReplaceGenerics::ignoreChildren(TypeId ty)
         // whenever we quantify, so the vectors overlap if and only if they are equal.
         return (!generics.empty() || !genericPacks.empty()) && (ftv->generics == generics) && (ftv->genericPacks == genericPacks);
     }
-    else if (get<ClassType>(ty))
+    else if (get<ExternType>(ty))
         return true;
     else
     {
@@ -168,6 +149,7 @@ bool ReplaceGenerics::isDirty(TypePackId tp)
 TypeId ReplaceGenerics::clean(TypeId ty)
 {
     LUAU_ASSERT(isDirty(ty));
+
     if (const TableType* ttv = log->getMutable<TableType>(ty))
     {
         TableType clone = TableType{ttv->props, ttv->indexer, level, scope, TableState::Free};
@@ -175,16 +157,8 @@ TypeId ReplaceGenerics::clean(TypeId ty)
         clone.definitionLocation = ttv->definitionLocation;
         return addType(std::move(clone));
     }
-    else if (FFlag::DebugLuauDeferredConstraintResolution)
-    {
-        TypeId res = freshType(NotNull{arena}, builtinTypes, scope);
-        getMutable<FreeType>(res)->level = level;
-        return res;
-    }
     else
-    {
-        return addType(FreeType{scope, level});
-    }
+        return arena->freshType(builtinTypes, scope, level);
 }
 
 TypePackId ReplaceGenerics::clean(TypePackId tp)
@@ -210,31 +184,38 @@ std::optional<TypeId> instantiate(
     if (ft->generics.empty() && ft->genericPacks.empty())
         return ty;
 
-    DenseHashMap<TypeId, TypeId> replacements{nullptr};
-    DenseHashMap<TypePackId, TypePackId> replacementPacks{nullptr};
+    DenseHashMap2<TypeId, TypeId> replacements;
+    DenseHashMap2<TypePackId, TypePackId> replacementPacks;
 
     for (TypeId g : ft->generics)
-        replacements[g] = freshType(arena, builtinTypes, scope);
+    {
+        if (auto gen = get<GenericType>(follow(g)))
+            replacements[g] = freshType(arena, builtinTypes, scope, gen->polarity);
+    }
 
     for (TypePackId g : ft->genericPacks)
-        replacementPacks[g] = arena->freshTypePack(scope);
+    {
+        if (auto gen = get<GenericTypePack>(follow(g)))
+            replacementPacks[g] = arena->freshTypePack(scope, gen->polarity);
+    }
 
-    Replacer r{arena, std::move(replacements), std::move(replacementPacks)};
+    Replacer r{arena, NotNull{&replacements}, NotNull{&replacementPacks}};
 
     if (limits->instantiationChildLimit)
         r.childLimit = *limits->instantiationChildLimit;
 
-    std::optional<TypeId> res = r.substitute(ty);
-    if (!res)
-        return res;
-
-    FunctionType* ft2 = getMutable<FunctionType>(*res);
+    CloneState cs{builtinTypes};
+    // We clone persistent types here to enable instantiation for generic
+    // builtins like `table.find`; otherwise, the lines after would
+    // immediately corrupt the definitions of the original function.
+    auto clonedFunctionTypeId = shallowClone(ty, *arena, cs, /* clonePersistentTypes */ true);
+    FunctionType* ft2 = getMutable<FunctionType>(clonedFunctionTypeId);
     LUAU_ASSERT(ft != ft2);
 
     ft2->generics.clear();
     ft2->genericPacks.clear();
 
-    return res;
+    return r.substitute(clonedFunctionTypeId);
 }
 
 } // namespace Luau

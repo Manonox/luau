@@ -1,4 +1,4 @@
-local function prequire(name) local success, result = pcall(require, name); return if success then result else nil end
+local function prequire(name) local success, result = pcall(require, name); return success and result end
 local bench = script and require(script.Parent.bench_support) or prequire("bench_support") or require("../bench_support")
 
 function test()
@@ -19,7 +19,7 @@ function test()
     end
 
     local ts0 = os.clock()
-    for i=1,100000 do
+    for i=1,1_000_000 do
         local n = Number.new(42)
     end
     local ts1 = os.clock()

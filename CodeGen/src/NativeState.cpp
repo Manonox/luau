@@ -40,7 +40,6 @@ void initFunctions(NativeContext& context)
     context.luaV_dolen = luaV_dolen;
     context.luaV_gettable = luaV_gettable;
     context.luaV_settable = luaV_settable;
-    context.luaV_getimport = luaV_getimport;
     context.luaV_concat = luaV_concat;
 
     context.luaH_getn = luaH_getn;
@@ -86,12 +85,16 @@ void initFunctions(NativeContext& context)
     context.forgLoopTableIter = forgLoopTableIter;
     context.forgLoopNodeIter = forgLoopNodeIter;
     context.forgLoopNonTableFallback = forgLoopNonTableFallback;
+    context.forgLoopNonTableFallback_DEPRECATED = forgLoopNonTableFallback_DEPRECATED;
     context.forgPrepXnextFallback = forgPrepXnextFallback;
     context.callProlog = callProlog;
     context.callEpilogC = callEpilogC;
     context.newUserdata = newUserdata;
+    context.newVector = newVector;
+    context.getImport = getImport;
 
     context.callFallback = callFallback;
+    context.fastPcallSetup = fastPcallSetup;
 
     context.executeGETGLOBAL = executeGETGLOBAL;
     context.executeSETGLOBAL = executeSETGLOBAL;

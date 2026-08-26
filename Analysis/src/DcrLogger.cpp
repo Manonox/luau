@@ -70,7 +70,7 @@ void write(JsonEmitter& emitter, const TypeBindingSnapshot& snapshot)
 }
 
 template<typename K, typename V>
-void write(JsonEmitter& emitter, const DenseHashMap<const K*, V>& map)
+void write(JsonEmitter& emitter, const DenseHashMap2<const K*, V>& map)
 {
     ObjectEmitter o = emitter.writeObject();
     for (const auto& [k, v] : map)
@@ -169,15 +169,39 @@ void write(JsonEmitter& emitter, const BoundarySnapshot& snapshot)
     o.finish();
 }
 
-void write(JsonEmitter& emitter, const StepSnapshot& snapshot)
+void write(JsonEmitter& emitter, const ConstraintStepSnapshot& snapshot)
 {
     ObjectEmitter o = emitter.writeObject();
+    o.writePair("type", "constraint");
     o.writePair("currentConstraint", snapshot.currentConstraint);
     o.writePair("forced", snapshot.forced);
     o.writePair("unsolvedConstraints", snapshot.unsolvedConstraints);
     o.writePair("rootScope", snapshot.rootScope);
     o.writePair("typeStrings", snapshot.typeStrings);
     o.finish();
+}
+
+void write(JsonEmitter& emitter, const GeneralizeStepSnapshot& eg)
+{
+    ObjectEmitter o = emitter.writeObject();
+    o.writePair("type", "generalize");
+    o.writePair("before", eg.before);
+    o.writePair("after", eg.after);
+    o.writePair("unsolvedConstraints", eg.unsolvedConstraints);
+    o.writePair("rootScope", eg.rootScope);
+    o.writePair("typeStrings", eg.typeStrings);
+    o.finish();
+}
+
+void write(JsonEmitter& emitter, const StepSnapshot& snap)
+{
+    visit(
+        [&](const auto& s)
+        {
+            write(emitter, s);
+        },
+        snap
+    );
 }
 
 void write(JsonEmitter& emitter, const TypeSolveLog& log)
@@ -253,10 +277,10 @@ static ScopeSnapshot snapshotScope(const Scope* scope, ToStringOptions& opts)
     }
 
     return ScopeSnapshot{
-        bindings,
-        typeBindings,
-        typePackBindings,
-        children,
+        std::move(bindings),
+        std::move(typeBindings),
+        std::move(typePackBindings),
+        std::move(children),
     };
 }
 
@@ -306,10 +330,12 @@ void DcrLogger::captureGenerationModule(const ModulePtr& module)
 void DcrLogger::captureGenerationError(const TypeError& error)
 {
     std::string stringifiedError = toString(error);
-    generationLog.errors.push_back(ErrorSnapshot{
-        /* message */ stringifiedError,
-        /* location */ error.location,
-    });
+    generationLog.errors.push_back(
+        ErrorSnapshot{
+            /* message */ std::move(stringifiedError),
+            /* location */ error.location,
+        }
+    );
 }
 
 void DcrLogger::pushBlock(NotNull<const Constraint> constraint, TypeId block)
@@ -354,7 +380,7 @@ void DcrLogger::popBlock(NotNull<const Constraint> block)
 static void snapshotTypeStrings(
     const std::vector<ExprTypesAtLocation>& interestedExprs,
     const std::vector<AnnotationTypesAtLocation>& interestedAnnots,
-    DenseHashMap<const void*, std::string>& map,
+    DenseHashMap2<const void*, std::string>& map,
     ToStringOptions& opts
 )
 {
@@ -398,7 +424,7 @@ void DcrLogger::captureInitialSolverState(const Scope* rootScope, const std::vec
     captureBoundaryState(solveLog.initialState, rootScope, unsolvedConstraints);
 }
 
-StepSnapshot DcrLogger::prepareStepSnapshot(
+ConstraintStepSnapshot DcrLogger::prepareStepSnapshot(
     const Scope* rootScope,
     NotNull<const Constraint> current,
     bool force,
@@ -406,31 +432,65 @@ StepSnapshot DcrLogger::prepareStepSnapshot(
 )
 {
     ScopeSnapshot scopeSnapshot = snapshotScope(rootScope, opts);
-    DenseHashMap<const Constraint*, ConstraintSnapshot> constraints{nullptr};
+    DenseHashMap2<const Constraint*, ConstraintSnapshot> constraints;
 
     for (NotNull<const Constraint> c : unsolvedConstraints)
     {
         constraints[c.get()] = {
-            toString(*c.get(), opts),
+            toString(*c, opts),
             c->location,
             snapshotBlocks(c),
         };
     }
 
-    DenseHashMap<const void*, std::string> typeStrings{nullptr};
+    DenseHashMap2<const void*, std::string> typeStrings;
     snapshotTypeStrings(generationLog.exprTypeLocations, generationLog.annotationTypeLocations, typeStrings, opts);
 
-    return StepSnapshot{
+    return ConstraintStepSnapshot{
         current,
         force,
         std::move(constraints),
-        scopeSnapshot,
+        std::move(scopeSnapshot),
+        std::move(typeStrings),
+    };
+}
+
+GeneralizeStepSnapshot DcrLogger::prepareGeneralizationSnapshot(
+    std::string before,
+    const Scope* rootScope,
+    const std::vector<NotNull<const Constraint>>& unsolvedConstraints
+)
+{
+    ScopeSnapshot scopeSnapshot = snapshotScope(rootScope, opts);
+    DenseHashMap2<const Constraint*, ConstraintSnapshot> constraints;
+
+    for (NotNull<const Constraint> c : unsolvedConstraints)
+    {
+        constraints[c.get()] = {
+            toString(*c, opts),
+            c->location,
+            snapshotBlocks(c),
+        };
+    }
+
+    DenseHashMap2<const void*, std::string> typeStrings;
+    snapshotTypeStrings(generationLog.exprTypeLocations, generationLog.annotationTypeLocations, typeStrings, opts);
+
+    return GeneralizeStepSnapshot{
+        std::move(before),
+        /*after*/ "", // to be filled in
+        std::move(constraints),
+        std::move(scopeSnapshot),
         std::move(typeStrings),
     };
 }
 
 void DcrLogger::commitStepSnapshot(StepSnapshot snapshot)
 {
+    // If the type wasn't changed under generalization, skip this.
+    if (auto eg = get_if<GeneralizeStepSnapshot>(&snapshot); eg && eg->before == eg->after)
+        return;
+
     solveLog.stepStates.push_back(std::move(snapshot));
 }
 
@@ -442,10 +502,12 @@ void DcrLogger::captureFinalSolverState(const Scope* rootScope, const std::vecto
 void DcrLogger::captureTypeCheckError(const TypeError& error)
 {
     std::string stringifiedError = toString(error);
-    checkLog.errors.push_back(ErrorSnapshot{
-        /* message */ stringifiedError,
-        /* location */ error.location,
-    });
+    checkLog.errors.push_back(
+        ErrorSnapshot{
+            /* message */ std::move(stringifiedError),
+            /* location */ error.location,
+        }
+    );
 }
 
 std::vector<ConstraintBlock> DcrLogger::snapshotBlocks(NotNull<const Constraint> c)

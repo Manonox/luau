@@ -18,7 +18,7 @@ struct NegationFixture : Fixture
 
     NegationFixture()
     {
-        registerHiddenTypes(&frontend);
+        registerHiddenTypes(getFrontend());
     }
 };
 
@@ -76,4 +76,5 @@ end
 )");
     LUAU_REQUIRE_NO_ERRORS(result);
 }
+
 TEST_SUITE_END();

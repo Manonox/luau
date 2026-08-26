@@ -44,6 +44,8 @@ int luaO_rawequalObj(const TValue* t1, const TValue* t2)
             return 1;
         case LUA_TNUMBER:
             return luai_numeq(nvalue(t1), nvalue(t2));
+        case LUA_TINTEGER:
+            return luai_inteq(lvalue(t1), lvalue(t2));
         case LUA_TVECTOR:
             return luai_veceq(vvalue(t1), vvalue(t2));
         case LUA_TBOOLEAN:
@@ -67,6 +69,8 @@ int luaO_rawequalKey(const TKey* t1, const TValue* t2)
             return 1;
         case LUA_TNUMBER:
             return luai_numeq(nvalue(t1), nvalue(t2));
+        case LUA_TINTEGER:
+            return luai_inteq(lvalue(t1), lvalue(t2));
         case LUA_TVECTOR:
             return luai_veceq(vvalue(t1), vvalue(t2));
         case LUA_TBOOLEAN:
@@ -96,6 +100,33 @@ int luaO_str2d(const char* s, double* result)
     return 1;
 }
 
+int luaO_str2l(const char* s, int64_t* result, int base)
+{
+    char* endptr = nullptr;
+    if (base == 10)
+    {
+        *result = luai_str2long(s, &endptr, base);
+        if (endptr == s)
+            return 0;                         // conversion failed
+        if (*endptr == 'x' || *endptr == 'X') // maybe an hexadecimal constant?
+            *result = (int64_t)strtoull(s, &endptr, 16);
+    }
+    else
+    {
+        // unsigned parse in other bases
+        *result = (int64_t)strtoull(s, &endptr, base);
+        if (endptr == s)
+            return 0;
+    }
+    if (*endptr == '\0')
+        return 1; // most common case
+    while (isspace(cast_to(unsigned char, *endptr)))
+        endptr++;
+    if (*endptr != '\0')
+        return 0; // invalid trailing characters?
+    return 1;
+}
+
 const char* luaO_pushvfstring(lua_State* L, const char* fmt, va_list argp)
 {
     char result[LUA_BUFFERSIZE];
@@ -116,6 +147,13 @@ const char* luaO_pushfstring(lua_State* L, const char* fmt, ...)
     return msg;
 }
 
+// Possible chunkname prefixes:
+//
+// '=' prefix: meant to represent custom chunknames. When truncation is needed,
+// the beginning of the chunkname is kept.
+//
+// '@' prefix: meant to represent filepaths. When truncation is needed, the end
+// of the filepath is kept, as this is more useful for identifying the file.
 const char* luaO_chunkid(char* buf, size_t buflen, const char* source, size_t srclen)
 {
     if (*source == '=')

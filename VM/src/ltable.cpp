@@ -33,6 +33,10 @@
 
 #include <string.h>
 
+// Set this to 1 to change the hash function to something different (and possibly trivial). Useful
+// for checking if a Lua program's behavior depends on the hash function.
+#define ALT_HASH_FUNCTION (0)
+
 // max size of both array and hash part is 2^MAXBITS
 #define MAXBITS 26
 #define MAXSIZE (1 << MAXBITS)
@@ -55,25 +59,28 @@ const LuaNode luaH_dummynode = {
 // hash is always reduced mod 2^k
 #define hashpow2(t, n) (gnode(t, lmod((n), sizenode(t))))
 
-#define hashstr(t, str) hashpow2(t, (str)->hash)
-#define hashboolean(t, p) hashpow2(t, p)
+#define hashstr(t, str) hashpow2(t, (ALT_HASH_FUNCTION ? 0x87654321 : 0) ^ (str)->hash)
+#define hashboolean(t, p) hashpow2(t, (ALT_HASH_FUNCTION ? 0x87654321 : 0) ^ p)
 
-static LuaNode* hashpointer(const Table* t, const void* p)
+static LuaNode* hashpointer(const LuaTable* t, const void* p)
 {
     // we discard the high 32-bit portion of the pointer on 64-bit platforms as it doesn't carry much entropy anyway
     unsigned int h = unsigned(uintptr_t(p));
 
     // MurmurHash3 32-bit finalizer
-    h ^= h >> 16;
-    h *= 0x85ebca6bu;
-    h ^= h >> 13;
-    h *= 0xc2b2ae35u;
-    h ^= h >> 16;
+    if (!ALT_HASH_FUNCTION)
+    {
+        h ^= h >> 16;
+        h *= 0x85ebca6bu;
+        h ^= h >> 13;
+        h *= 0xc2b2ae35u;
+        h ^= h >> 16;
+    }
 
     return hashpow2(t, h);
 }
 
-static LuaNode* hashnum(const Table* t, double n)
+static LuaNode* hashnum(const LuaTable* t, double n)
 {
     static_assert(sizeof(double) == sizeof(unsigned int) * 2, "expected a 8-byte double");
     unsigned int i[2];
@@ -86,20 +93,51 @@ static LuaNode* hashnum(const Table* t, double n)
     // finalizer from MurmurHash64B
     const uint32_t m = 0x5bd1e995;
 
-    h1 ^= h2 >> 18;
-    h1 *= m;
-    h2 ^= h1 >> 22;
-    h2 *= m;
-    h1 ^= h2 >> 17;
-    h1 *= m;
-    h2 ^= h1 >> 19;
-    h2 *= m;
+    if (!ALT_HASH_FUNCTION)
+    {
+        h1 ^= h2 >> 18;
+        h1 *= m;
+        h2 ^= h1 >> 22;
+        h2 *= m;
+        h1 ^= h2 >> 17;
+        h1 *= m;
+        h2 ^= h1 >> 19;
+        h2 *= m;
+    }
 
     // ... truncated to 32-bit output (normally hash is equal to (uint64_t(h1) << 32) | h2, but we only really need the lower 32-bit half)
     return hashpow2(t, h2);
 }
 
-static LuaNode* hashvec(const Table* t, const float* v)
+static LuaNode* hashint(const LuaTable* t, int64_t n)
+{
+    static_assert(sizeof(n) == sizeof(unsigned int) * 2, "expected a 8-byte integer");
+    unsigned int i[2];
+    memcpy(i, &n, sizeof(i));
+
+    uint32_t h1 = i[0];
+    uint32_t h2 = i[1];
+
+    // finalizer from MurmurHash64B
+    const uint32_t m = 0x5bd1e995;
+
+    if (!ALT_HASH_FUNCTION)
+    {
+        h1 ^= h2 >> 18;
+        h1 *= m;
+        h2 ^= h1 >> 22;
+        h2 *= m;
+        h1 ^= h2 >> 17;
+        h1 *= m;
+        h2 ^= h1 >> 19;
+        h2 *= m;
+    }
+
+    // ... truncated to 32-bit output (normally hash is equal to (uint64_t(h1) << 32) | h2, but we only really need the lower 32-bit half)
+    return hashpow2(t, h2);
+}
+
+LUAU_MAYBE_UNUSED static LuaNode* hashvec(const LuaTable* t, const float* v)
 {
     unsigned int i[LUA_VECTOR_SIZE];
     memcpy(i, v, sizeof(i));
@@ -110,9 +148,12 @@ static LuaNode* hashvec(const Table* t, const float* v)
     i[2] = (i[2] == 0x80000000) ? 0 : i[2];
 
     // scramble bits to make sure that integer coordinates have entropy in lower bits
-    i[0] ^= i[0] >> 17;
-    i[1] ^= i[1] >> 17;
-    i[2] ^= i[2] >> 17;
+    if (!ALT_HASH_FUNCTION)
+    {
+        i[0] ^= i[0] >> 17;
+        i[1] ^= i[1] >> 17;
+        i[2] ^= i[2] >> 17;
+    }
 
     // Optimized Spatial Hashing for Collision Detection of Deformable Objects
     unsigned int h = (i[0] * 73856093) ^ (i[1] * 19349663) ^ (i[2] * 83492791);
@@ -126,16 +167,48 @@ static LuaNode* hashvec(const Table* t, const float* v)
     return hashpow2(t, h);
 }
 
+static LUAU_MAYBE_UNUSED LuaNode* hashvec(const LuaTable* t, const double* v)
+{
+    uint64_t i[LUA_VECTOR_SIZE];
+    memcpy(i, v, sizeof(i));
+
+    // convert -0 to 0 to make sure they hash to the same value
+    i[0] = (i[0] == 0x8000000000000000ull) ? 0 : i[0];
+    i[1] = (i[1] == 0x8000000000000000ull) ? 0 : i[1];
+    i[2] = (i[2] == 0x8000000000000000ull) ? 0 : i[2];
+
+    // scramble bits to make sure that integer coordinates have entropy in lower bits
+    if (!ALT_HASH_FUNCTION)
+    {
+        i[0] ^= i[0] >> 32;
+        i[1] ^= i[1] >> 32;
+        i[2] ^= i[2] >> 32;
+    }
+
+    // Optimized Spatial Hashing for Collision Detection of Deformable Objects
+    unsigned int h = uint32_t(i[0] * 73856093) ^ uint32_t(i[1] * 19349663) ^ uint32_t(i[2] * 83492791);
+
+#if LUA_VECTOR_SIZE == 4
+    i[3] = (i[3] == 0x8000000000000000ull) ? 0 : i[3];
+    i[3] ^= i[3] >> 32;
+    h ^= uint32_t(i[3] * 39916801);
+#endif
+
+    return hashpow2(t, h);
+}
+
 /*
 ** returns the `main' position of an element in a table (that is, the index
 ** of its hash value)
 */
-static LuaNode* mainposition(const Table* t, const TValue* key)
+static LuaNode* mainposition(const LuaTable* t, const TValue* key)
 {
     switch (ttype(key))
     {
     case LUA_TNUMBER:
         return hashnum(t, nvalue(key));
+    case LUA_TINTEGER:
+        return hashint(t, lvalue(key));
     case LUA_TVECTOR:
         return hashvec(t, vvalue(key));
     case LUA_TSTRING:
@@ -166,7 +239,7 @@ static int arrayindex(double key)
 ** elements in the array part, then elements in the hash part. The
 ** beginning of a traversal is signalled by -1.
 */
-static int findindex(lua_State* L, Table* t, StkId key)
+static int findindex(lua_State* L, LuaTable* t, StkId key)
 {
     int i;
     if (ttisnil(key))
@@ -194,7 +267,7 @@ static int findindex(lua_State* L, Table* t, StkId key)
     }
 }
 
-int luaH_next(lua_State* L, Table* t, StkId key)
+int luaH_next(lua_State* L, LuaTable* t, StkId key)
 {
     int i = findindex(L, t, key); // find original element
     for (i++; i < t->sizearray; i++)
@@ -270,7 +343,7 @@ static int countint(double key, int* nums)
         return 0;
 }
 
-static int numusearray(const Table* t, int* nums)
+static int numusearray(const LuaTable* t, int* nums)
 {
     int lg;
     int ttlg;     // 2^lg
@@ -298,7 +371,7 @@ static int numusearray(const Table* t, int* nums)
     return ause;
 }
 
-static int numusehash(const Table* t, int* nums, int* pnasize)
+static int numusehash(const LuaTable* t, int* nums, int* pnasize)
 {
     int totaluse = 0; // total number of elements
     int ause = 0;     // summation of `nums'
@@ -317,7 +390,7 @@ static int numusehash(const Table* t, int* nums, int* pnasize)
     return totaluse;
 }
 
-static void setarrayvector(lua_State* L, Table* t, int size)
+static void setarrayvector(lua_State* L, LuaTable* t, int size)
 {
     if (size > MAXSIZE)
         luaG_runerror(L, "table overflow");
@@ -328,7 +401,7 @@ static void setarrayvector(lua_State* L, Table* t, int size)
     t->sizearray = size;
 }
 
-static void setnodevector(lua_State* L, Table* t, int size)
+static void setnodevector(lua_State* L, LuaTable* t, int size)
 {
     int lsize;
     if (size == 0)
@@ -357,23 +430,23 @@ static void setnodevector(lua_State* L, Table* t, int size)
     t->lastfree = size; // all positions are free
 }
 
-static TValue* newkey(lua_State* L, Table* t, const TValue* key);
+static TValue* newkey(lua_State* L, LuaTable* t, const TValue* key);
 
-static TValue* arrayornewkey(lua_State* L, Table* t, const TValue* key)
+static TValue* arrayornewkey(lua_State* L, LuaTable* t, const TValue* key)
 {
     if (ttisnumber(key))
     {
         int k;
         double n = nvalue(key);
         luai_num2int(k, n);
-        if (luai_numeq(cast_num(k), n) && cast_to(unsigned int, k - 1) < cast_to(unsigned int, t->sizearray))
+        if (luai_numeq(cast_num(k), n) && unsigned(k) - 1 < unsigned(t->sizearray))
             return &t->array[k - 1];
     }
 
     return newkey(L, t, key);
 }
 
-static void resize(lua_State* L, Table* t, int nasize, int nhsize)
+static void resize(lua_State* L, LuaTable* t, int nasize, int nhsize)
 {
     if (nasize > MAXSIZE || nhsize > MAXSIZE)
         luaG_runerror(L, "table overflow");
@@ -424,7 +497,7 @@ static void resize(lua_State* L, Table* t, int nasize, int nhsize)
         luaM_freearray(L, nold, twoto(oldhsize), LuaNode, t->memcat); // free old array
 }
 
-static int adjustasize(Table* t, int size, const TValue* ek)
+static int adjustasize(LuaTable* t, int size, const TValue* ek)
 {
     bool tbound = t->node != dummynode || size < t->sizearray;
     int ekindex = ek && ttisnumber(ek) ? arrayindex(nvalue(ek)) : -1;
@@ -434,19 +507,19 @@ static int adjustasize(Table* t, int size, const TValue* ek)
     return size;
 }
 
-void luaH_resizearray(lua_State* L, Table* t, int nasize)
+void luaH_resizearray(lua_State* L, LuaTable* t, int nasize)
 {
     int nsize = (t->node == dummynode) ? 0 : sizenode(t);
     int asize = adjustasize(t, nasize, NULL);
     resize(L, t, asize, nsize);
 }
 
-void luaH_resizehash(lua_State* L, Table* t, int nhsize)
+void luaH_resizehash(lua_State* L, LuaTable* t, int nhsize)
 {
     resize(L, t, t->sizearray, nhsize);
 }
 
-static void rehash(lua_State* L, Table* t, const TValue* ek)
+static void rehash(lua_State* L, LuaTable* t, const TValue* ek)
 {
     int nums[MAXBITS + 1]; // nums[i] = number of keys between 2^(i-1) and 2^i
     for (int i = 0; i <= MAXBITS; i++)
@@ -491,9 +564,9 @@ static void rehash(lua_State* L, Table* t, const TValue* ek)
 ** }=============================================================
 */
 
-Table* luaH_new(lua_State* L, int narray, int nhash)
+LuaTable* luaH_new(lua_State* L, int narray, int nhash)
 {
-    Table* t = luaM_newgco(L, Table, sizeof(Table), L->activememcat);
+    LuaTable* t = luaM_newgco(L, LuaTable, sizeof(LuaTable), L->activememcat);
     luaC_init(L, t, LUA_TTABLE);
     t->metatable = NULL;
     t->tmcache = cast_byte(~0);
@@ -512,16 +585,16 @@ Table* luaH_new(lua_State* L, int narray, int nhash)
     return t;
 }
 
-void luaH_free(lua_State* L, Table* t, lua_Page* page)
+void luaH_free(lua_State* L, LuaTable* t, lua_Page* page)
 {
     if (t->node != dummynode)
         luaM_freearray(L, t->node, sizenode(t), LuaNode, t->memcat);
     if (t->array)
         luaM_freearray(L, t->array, t->sizearray, TValue, t->memcat);
-    luaM_freegco(L, t, sizeof(Table), t->memcat, page);
+    luaM_freegco(L, t, sizeof(LuaTable), t->memcat, page);
 }
 
-static LuaNode* getfreepos(Table* t)
+static LuaNode* getfreepos(LuaTable* t)
 {
     while (t->lastfree > 0)
     {
@@ -541,7 +614,7 @@ static LuaNode* getfreepos(Table* t)
 ** put new key in its main position; otherwise (colliding node is in its main
 ** position), new key goes to an empty position.
 */
-static TValue* newkey(lua_State* L, Table* t, const TValue* key)
+static TValue* newkey(lua_State* L, LuaTable* t, const TValue* key)
 {
     // enforce boundary invariant
     if (ttisnumber(key) && nvalue(key) == t->sizearray + 1)
@@ -601,10 +674,10 @@ static TValue* newkey(lua_State* L, Table* t, const TValue* key)
 /*
 ** search function for integers
 */
-const TValue* luaH_getnum(Table* t, int key)
+const TValue* luaH_getnum(LuaTable* t, int key)
 {
     // (1 <= key && key <= t->sizearray)
-    if (cast_to(unsigned int, key - 1) < cast_to(unsigned int, t->sizearray))
+    if (unsigned(key) - 1 < unsigned(t->sizearray))
         return &t->array[key - 1];
     else if (t->node != dummynode)
     {
@@ -627,7 +700,7 @@ const TValue* luaH_getnum(Table* t, int key)
 /*
 ** search function for strings
 */
-const TValue* luaH_getstr(Table* t, TString* key)
+const TValue* luaH_getstr(LuaTable* t, TString* key)
 {
     LuaNode* n = hashstr(t, key);
     for (;;)
@@ -642,9 +715,27 @@ const TValue* luaH_getstr(Table* t, TString* key)
 }
 
 /*
+** search function for lightuserdata
+*/
+const TValue* luaH_getp(LuaTable* t, void* key, int tag)
+{
+    LuaNode* n = hashpointer(t, key);
+    for (;;)
+    { // check whether `key' is somewhere in the chain
+        const TKey* nk = gkey(n);
+        if (ttislightuserdata(nk) && pvalue(nk) == key && lightuserdatatag(nk) == tag)
+            return gval(n); // that's it
+        if (gnext(n) == 0)
+            break;
+        n += gnext(n);
+    }
+    return luaO_nilobject;
+}
+
+/*
 ** main search function
 */
-const TValue* luaH_get(Table* t, const TValue* key)
+const TValue* luaH_get(LuaTable* t, const TValue* key)
 {
     switch (ttype(key))
     {
@@ -659,7 +750,7 @@ const TValue* luaH_get(Table* t, const TValue* key)
         luai_num2int(k, n);
         if (luai_numeq(cast_num(k), nvalue(key))) // index is int?
             return luaH_getnum(t, k);             // use specialized version
-                                                  // else go through
+        LUAU_FALLTHROUGH;                         // else go through
     }
     default:
     {
@@ -677,7 +768,7 @@ const TValue* luaH_get(Table* t, const TValue* key)
     }
 }
 
-TValue* luaH_set(lua_State* L, Table* t, const TValue* key)
+TValue* luaH_set(lua_State* L, LuaTable* t, const TValue* key)
 {
     const TValue* p = luaH_get(t, key);
     invalidateTMcache(t);
@@ -687,7 +778,7 @@ TValue* luaH_set(lua_State* L, Table* t, const TValue* key)
         return luaH_newkey(L, t, key);
 }
 
-TValue* luaH_newkey(lua_State* L, Table* t, const TValue* key)
+TValue* luaH_newkey(lua_State* L, LuaTable* t, const TValue* key)
 {
     if (ttisnil(key))
         luaG_runerror(L, "table index is nil");
@@ -698,10 +789,10 @@ TValue* luaH_newkey(lua_State* L, Table* t, const TValue* key)
     return newkey(L, t, key);
 }
 
-TValue* luaH_setnum(lua_State* L, Table* t, int key)
+TValue* luaH_setnum(lua_State* L, LuaTable* t, int key)
 {
     // (1 <= key && key <= t->sizearray)
-    if (cast_to(unsigned int, key - 1) < cast_to(unsigned int, t->sizearray))
+    if (unsigned(key) - 1 < unsigned(t->sizearray))
         return &t->array[key - 1];
     // hash fallback
     const TValue* p = luaH_getnum(t, key);
@@ -715,7 +806,7 @@ TValue* luaH_setnum(lua_State* L, Table* t, int key)
     }
 }
 
-TValue* luaH_setstr(lua_State* L, Table* t, TString* key)
+TValue* luaH_setstr(lua_State* L, LuaTable* t, TString* key)
 {
     const TValue* p = luaH_getstr(t, key);
     invalidateTMcache(t);
@@ -729,7 +820,20 @@ TValue* luaH_setstr(lua_State* L, Table* t, TString* key)
     }
 }
 
-static int updateaboundary(Table* t, int boundary)
+TValue* luaH_setp(lua_State* L, LuaTable* t, void* key, int tag)
+{
+    const TValue* p = luaH_getp(t, key, tag);
+    if (p != luaO_nilobject)
+        return cast_to(TValue*, p);
+    else
+    {
+        TValue k;
+        setpvalue(&k, key, tag);
+        return newkey(L, t, &k);
+    }
+}
+
+static int updateaboundary(LuaTable* t, int boundary)
 {
     if (boundary < t->sizearray && ttisnil(&t->array[boundary - 1]))
     {
@@ -752,7 +856,7 @@ static int updateaboundary(Table* t, int boundary)
 ** Try to find a boundary in table `t'. A `boundary' is an integer index
 ** such that t[i] is non-nil and t[i+1] is nil (and 0 if t[1] is nil).
 */
-int luaH_getn(Table* t)
+int luaH_getn(LuaTable* t)
 {
     int boundary = getaboundary(t);
 
@@ -793,9 +897,9 @@ int luaH_getn(Table* t)
     }
 }
 
-Table* luaH_clone(lua_State* L, Table* tt)
+LuaTable* luaH_clone(lua_State* L, LuaTable* tt)
 {
-    Table* t = luaM_newgco(L, Table, sizeof(Table), L->activememcat);
+    LuaTable* t = luaM_newgco(L, LuaTable, sizeof(LuaTable), L->activememcat);
     luaC_init(L, t, LUA_TTABLE);
     t->metatable = tt->metatable;
     t->tmcache = tt->tmcache;
@@ -830,7 +934,7 @@ Table* luaH_clone(lua_State* L, Table* tt)
     return t;
 }
 
-void luaH_clear(Table* tt)
+void luaH_clear(LuaTable* tt)
 {
     // clear array part
     for (int i = 0; i < tt->sizearray; ++i)

@@ -1,5 +1,5 @@
 --!strict
-local function prequire(name) local success, result = pcall(require, name); return if success then result else nil end
+local function prequire(name) local success, result = pcall(require, name); return success and result end
 local bench = script and require(script.Parent.bench_support) or prequire("bench_support") or require("../bench_support")
 
 function test()
@@ -249,7 +249,9 @@ function test()
     init_indices()
     calculate_normals()
     compute_triangle_cones()
-    compute_tangent_space()
+    local checksum = compute_tangent_space()
+
+    assert(math.abs(checksum + 1323.4993) < 1e-2)
 end
 
 bench.runCode(test, "mesh-normal-scalar")

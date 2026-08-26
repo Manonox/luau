@@ -1,455 +1,433 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 
+#include "Luau/TableLiteralInference.h"
+
 #include "Luau/Ast.h"
-#include "Luau/Normalize.h"
+#include "Luau/Common.h"
+#include "Luau/ConstraintSolver.h"
+#include "Luau/HashUtil.h"
+#include "Luau/IterativeTypeVisitor.h"
 #include "Luau/Simplify.h"
+#include "Luau/Subtyping.h"
 #include "Luau/Type.h"
 #include "Luau/ToString.h"
-#include "Luau/TypeArena.h"
+#include "Luau/TypeUtils.h"
 #include "Luau/Unifier2.h"
+
+LUAU_FASTFLAGVARIABLE(LuauBidirectionalInferenceBetterLambdaHandling)
+LUAU_FASTFLAG(LuauBidirectionalInferenceSimplifyTables)
+LUAU_FASTFLAG(LuauRelaxConstraintOrderingForFunctionCheck)
 
 namespace Luau
 {
 
-static bool isLiteral(const AstExpr* expr)
+namespace
 {
-    return (
-        expr->is<AstExprTable>() || expr->is<AstExprFunction>() || expr->is<AstExprConstantNumber>() || expr->is<AstExprConstantString>() ||
-        expr->is<AstExprConstantBool>() || expr->is<AstExprConstantNil>()
-    );
-}
 
-// A fast approximation of subTy <: superTy
-static bool fastIsSubtype(TypeId subTy, TypeId superTy)
+struct FindFunctionTypeIn : IterativeTypeVisitor
 {
-    Relation r = relate(superTy, subTy);
-    return r == Relation::Coincident || r == Relation::Superset;
-}
+    int numberOfLambdaParameters;
+    const FunctionType* candidate = nullptr;
+    bool ambiguous = false;
 
-static bool isRecord(const AstExprTable::Item& item)
-{
-    if (item.kind == AstExprTable::Item::Record)
-        return true;
-    else if (item.kind == AstExprTable::Item::General && item.key->is<AstExprConstantString>())
-        return true;
-    else
+    explicit FindFunctionTypeIn(int numberOfLambdaParameters)
+        : IterativeTypeVisitor("FindFunctionTypeIn", true, true)
+        , numberOfLambdaParameters(numberOfLambdaParameters)
+    {
+    }
+
+    bool visit(TypeId) override
+    {
         return false;
+    }
+
+    bool visit(TypeId, const UnionType&) override
+    {
+        return true;
+    }
+
+    bool visit(TypeId, const IntersectionType&) override
+    {
+        return true;
+    }
+
+    bool visit(TypeId ty, const FunctionType& ftv) override
+    {
+        // This logic is a little clowny.
+        //
+        // For bidirectional inference we're trying to _guess_ what the user
+        // is intending so that we can give decent results. For functions, we
+        // will error if the user doesn't provide exactly the correct number of
+        // arguments. However, consider:
+        //
+        //  local f: (ReallyComplexTableType, boolean) -> () = function (tbl)
+        //      tbl.|
+        //  end
+        //
+        // ... the user would probably prefer to have autocomplete here while
+        // they're writing the function, even if we'll eventually error. Or,
+        // the user may be in nonstrict mode.
+        //
+        // On top of that we have to do a bunch of `int` casting here.
+        if (FFlag::LuauBidirectionalInferenceBetterLambdaHandling)
+        {
+            if (candidate == nullptr)
+            {
+                candidate = get<FunctionType>(ty);
+                ambiguous = false;
+                return false;
+            }
+
+            int candidateDistance = std::abs(int(size(candidate->argTypes)) - numberOfLambdaParameters);
+            int thisDistance = std::abs(int(size(ftv.argTypes)) - numberOfLambdaParameters);
+
+            if (thisDistance < candidateDistance)
+            {
+                candidate = get<FunctionType>(ty);
+                ambiguous = false;
+            }
+            else if (thisDistance == candidateDistance)
+            {
+                ambiguous = true;
+            }
+        }
+        else
+        {
+            if (candidate == nullptr ||
+                std::abs(int(size(candidate->argTypes)) - numberOfLambdaParameters) > std::abs(int(size(ftv.argTypes)) - numberOfLambdaParameters))
+            {
+                candidate = get<FunctionType>(ty);
+                return false;
+            }
+        }
+        return false;
+    }
+};
+
+/**
+ * Is this an expression that we can check has an expected type, for now this
+ * is limited to literals (including lambdas, "function literals"), groups
+ * (parenthesized expressions), and if-else expressions.
+ */
+bool isCheckableExpr(const AstExpr* expr)
+{
+    return isLiteral(expr) || expr->is<AstExprGroup>() || expr->is<AstExprIfElse>();
 }
 
-static std::optional<TypeId> extractMatchingTableType(std::vector<TypeId>& tables, TypeId exprType, NotNull<BuiltinTypes> builtinTypes)
+struct BidirectionalTypePusher
 {
-    if (tables.empty())
-        return std::nullopt;
 
-    const TableType* exprTable = get<TableType>(follow(exprType));
-    if (!exprTable)
-        return std::nullopt;
+    NotNull<DenseHashMap2<const AstExpr*, TypeId>> astTypes;
+    NotNull<DenseHashMap2<const AstExpr*, TypeId>> astExpectedTypes;
 
-    size_t tableCount = 0;
-    std::optional<TypeId> firstTable;
+    NotNull<ConstraintSolver> solver;
+    NotNull<const Constraint> constraint;
+    NotNull<DenseHashSet2<const void*>> genericTypesAndPacks;
+    NotNull<Unifier2> unifier;
+    NotNull<Subtyping> subtyping;
 
-    for (TypeId ty : tables)
+    std::vector<IncompleteInference> incompleteInferences;
+
+    DenseHashSet2<std::pair<TypeId, const AstExpr*>, PairHash<TypeId, const AstExpr*>> seen;
+
+    BidirectionalTypePusher(
+        NotNull<DenseHashMap2<const AstExpr*, TypeId>> astTypes,
+        NotNull<DenseHashMap2<const AstExpr*, TypeId>> astExpectedTypes,
+        NotNull<ConstraintSolver> solver,
+        NotNull<const Constraint> constraint,
+        NotNull<DenseHashSet2<const void*>> genericTypesAndPacks,
+        NotNull<Unifier2> unifier,
+        NotNull<Subtyping> subtyping
+    )
+        : astTypes{astTypes}
+        , astExpectedTypes{astExpectedTypes}
+        , solver{solver}
+        , constraint{constraint}
+        , genericTypesAndPacks{genericTypesAndPacks}
+        , unifier{unifier}
+        , subtyping{subtyping}
     {
-        ty = follow(ty);
-        if (auto tt = get<TableType>(ty))
+    }
+
+    TypeId pushType(TypeId expectedType, const AstExpr* expr)
+    {
+        (*astExpectedTypes)[expr] = expectedType;
+        // We may not have a type here if this is the last argument
+        // passed to a function call: this is potentially expected
+        // behavior.
+        if (!astTypes->contains(expr))
+            return solver->builtinTypes->anyType;
+
+        TypeId exprType = *astTypes->find(expr);
+
+        if (seen.contains({expectedType, expr}))
+            return exprType;
+        seen.insert({expectedType, expr});
+
+        expectedType = follow(expectedType);
+        exprType = follow(exprType);
+
+        if (FFlag::LuauRelaxConstraintOrderingForFunctionCheck && !isCheckableExpr(expr))
         {
-            // If the expected table has a key whose type is a string or boolean
-            // singleton and the corresponding exprType property does not match,
-            // then skip this table.
-
-            if (!firstTable)
-                firstTable = ty;
-            ++tableCount;
-
-            for (const auto& [name, expectedProp] : tt->props)
-            {
-                if (!expectedProp.readTy)
-                    continue;
-
-                const TypeId expectedType = follow(*expectedProp.readTy);
-
-                auto st = get<SingletonType>(expectedType);
-                if (!st)
-                    continue;
-
-                auto it = exprTable->props.find(name);
-                if (it == exprTable->props.end())
-                    continue;
-
-                const auto& [_name, exprProp] = *it;
-
-                if (!exprProp.readTy)
-                    continue;
-
-                const TypeId propType = follow(*exprProp.readTy);
-
-                const FreeType* ft = get<FreeType>(propType);
-
-                if (ft && get<SingletonType>(ft->lowerBound))
-                {
-                    if (fastIsSubtype(builtinTypes->booleanType, ft->upperBound) && fastIsSubtype(expectedType, builtinTypes->booleanType))
-                    {
-                        return ty;
-                    }
-
-                    if (fastIsSubtype(builtinTypes->stringType, ft->upperBound) && fastIsSubtype(expectedType, ft->lowerBound))
-                    {
-                        return ty;
-                    }
-                }
-            }
-        }
-    }
-
-    if (tableCount == 1)
-    {
-        LUAU_ASSERT(firstTable);
-        return firstTable;
-    }
-
-    return std::nullopt;
-}
-
-TypeId matchLiteralType(
-    NotNull<DenseHashMap<const AstExpr*, TypeId>> astTypes,
-    NotNull<DenseHashMap<const AstExpr*, TypeId>> astExpectedTypes,
-    NotNull<BuiltinTypes> builtinTypes,
-    NotNull<TypeArena> arena,
-    NotNull<Unifier2> unifier,
-    TypeId expectedType,
-    TypeId exprType,
-    const AstExpr* expr,
-    std::vector<TypeId>& toBlock
-)
-{
-    /*
-     * Table types that arise from literal table expressions have some
-     * properties that make this algorithm much simpler.
-     *
-     * Most importantly, the parts of the type that arise directly from the
-     * table expression are guaranteed to be acyclic.  This means we can do all
-     * kinds of naive depth first traversal shenanigans and not worry about
-     * nasty details like aliasing or reentrancy.
-     *
-     * We are therefore completely free to mutate these portions of the
-     * TableType however we choose!  We'll take advantage of this property to do
-     * things like replace explicit named properties with indexers as required
-     * by the expected type.
-     */
-    if (!isLiteral(expr))
-        return exprType;
-
-    expectedType = follow(expectedType);
-    exprType = follow(exprType);
-
-    if (get<AnyType>(expectedType) || get<UnknownType>(expectedType))
-    {
-        // "Narrowing" to unknown or any is not going to do anything useful.
-        return exprType;
-    }
-
-    if (expr->is<AstExprConstantString>())
-    {
-        auto ft = get<FreeType>(exprType);
-        if (ft && get<SingletonType>(ft->lowerBound) && fastIsSubtype(builtinTypes->stringType, ft->upperBound) &&
-            fastIsSubtype(ft->lowerBound, builtinTypes->stringType))
-        {
-            // if the upper bound is a subtype of the expected type, we can push the expected type in
-            Relation upperBoundRelation = relate(ft->upperBound, expectedType);
-            if (upperBoundRelation == Relation::Subset || upperBoundRelation == Relation::Coincident)
-            {
-                emplaceType<BoundType>(asMutable(exprType), expectedType);
-                return exprType;
-            }
-
-            // likewise, if the lower bound is a subtype, we can force the expected type in
-            // if this is the case and the previous relation failed, it means that the primitive type
-            // constraint was going to have to select the lower bound for this type anyway.
-            Relation lowerBoundRelation = relate(ft->lowerBound, expectedType);
-            if (lowerBoundRelation == Relation::Subset || lowerBoundRelation == Relation::Coincident)
-            {
-                emplaceType<BoundType>(asMutable(exprType), expectedType);
-                return exprType;
-            }
-        }
-    }
-    else if (expr->is<AstExprConstantBool>())
-    {
-        auto ft = get<FreeType>(exprType);
-        if (ft && get<SingletonType>(ft->lowerBound) && fastIsSubtype(builtinTypes->booleanType, ft->upperBound) &&
-            fastIsSubtype(ft->lowerBound, builtinTypes->booleanType))
-        {
-            // if the upper bound is a subtype of the expected type, we can push the expected type in
-            Relation upperBoundRelation = relate(ft->upperBound, expectedType);
-            if (upperBoundRelation == Relation::Subset || upperBoundRelation == Relation::Coincident)
-            {
-                emplaceType<BoundType>(asMutable(exprType), expectedType);
-                return exprType;
-            }
-
-            // likewise, if the lower bound is a subtype, we can force the expected type in
-            // if this is the case and the previous relation failed, it means that the primitive type
-            // constraint was going to have to select the lower bound for this type anyway.
-            Relation lowerBoundRelation = relate(ft->lowerBound, expectedType);
-            if (lowerBoundRelation == Relation::Subset || lowerBoundRelation == Relation::Coincident)
-            {
-                emplaceType<BoundType>(asMutable(exprType), expectedType);
-                return exprType;
-            }
-        }
-    }
-
-    if (expr->is<AstExprConstantString>() || expr->is<AstExprConstantNumber>() || expr->is<AstExprConstantBool>() || expr->is<AstExprConstantNil>())
-    {
-        if (auto ft = get<FreeType>(exprType); ft && fastIsSubtype(ft->upperBound, expectedType))
-        {
-            emplaceType<BoundType>(asMutable(exprType), expectedType);
+            // NOTE: For now we aren't using the result of this function, so
+            // just return the original expression type.
             return exprType;
         }
 
-        Relation r = relate(exprType, expectedType);
-        if (r == Relation::Coincident || r == Relation::Subset)
-            return expectedType;
 
-        return exprType;
-    }
+        // NOTE: We cannot block on free types here, as that trivially means
+        // any recursive function would have a cycle, consider:
+        //
+        //  local function fact(n)
+        //      return if n < 2 then 1 else n * fact(n - 1)
+        //  end
+        //
+        // We'll have a cycle between trying to push `fact`'s type into its
+        // arguments and generalizing `fact`.
 
-    // TODO: lambdas
-
-    if (auto exprTable = expr->as<AstExprTable>())
-    {
-        TableType* const tableTy = getMutable<TableType>(exprType);
-        LUAU_ASSERT(tableTy);
-
-        const TableType* expectedTableTy = get<TableType>(expectedType);
-
-        if (!expectedTableTy)
+        if (auto tfit = get<TypeFunctionInstanceType>(expectedType); tfit && tfit->state == TypeFunctionInstanceState::Unsolved)
         {
-            if (auto utv = get<UnionType>(expectedType))
-            {
-                std::vector<TypeId> parts{begin(utv), end(utv)};
-
-                std::optional<TypeId> tt = extractMatchingTableType(parts, exprType, builtinTypes);
-
-                if (tt)
-                {
-                    TypeId res = matchLiteralType(astTypes, astExpectedTypes, builtinTypes, arena, unifier, *tt, exprType, expr, toBlock);
-
-                    parts.push_back(res);
-                    return arena->addType(UnionType{std::move(parts)});
-                }
-            }
-
+            incompleteInferences.push_back(IncompleteInference{expectedType, exprType, expr});
             return exprType;
         }
 
-        for (const AstExprTable::Item& item : exprTable->items)
+        if (is<BlockedType, PendingExpansionType>(expectedType))
         {
-            if (isRecord(item))
+            incompleteInferences.push_back(IncompleteInference{expectedType, exprType, expr});
+            return exprType;
+        }
+
+        if (is<AnyType, UnknownType>(expectedType))
+            return exprType;
+
+        if (auto group = expr->as<AstExprGroup>())
+        {
+            pushType(expectedType, group->expr);
+            return exprType;
+        }
+
+        if (auto ternary = expr->as<AstExprIfElse>())
+        {
+            pushType(expectedType, ternary->trueExpr);
+            pushType(expectedType, ternary->falseExpr);
+            return exprType;
+        }
+
+        if (!FFlag::LuauRelaxConstraintOrderingForFunctionCheck)
+        {
+            if (!isLiteral(expr))
+                // NOTE: For now we aren't using the result of this function, so
+                // just return the original expression type.
+                return exprType;
+        }
+
+
+        if (expr->is<AstExprConstantString>() || expr->is<AstExprConstantNumber>() || expr->is<AstExprConstantBool>() ||
+            expr->is<AstExprConstantNil>())
+        {
+            if (auto ft = get<FreeType>(exprType))
             {
-                const AstArray<char>& s = item.key->as<AstExprConstantString>()->value;
-                std::string keyStr{s.data, s.data + s.size};
-                auto it = tableTy->props.find(keyStr);
-                LUAU_ASSERT(it != tableTy->props.end());
-
-                Property& prop = it->second;
-
-                // Table literals always initially result in shared read-write types
-                LUAU_ASSERT(prop.isShared());
-                TypeId propTy = *prop.readTy;
-
-                auto it2 = expectedTableTy->props.find(keyStr);
-
-                if (it2 == expectedTableTy->props.end())
+                if (maybeSingleton(expectedType) && maybeSingleton(ft->lowerBound))
                 {
-                    // expectedType may instead have an indexer.  This is
-                    // kind of interesting because it means we clip the prop
-                    // from the exprType and fold it into the indexer.
-                    if (expectedTableTy->indexer && isString(expectedTableTy->indexer->indexType))
-                    {
-                        (*astExpectedTypes)[item.key] = expectedTableTy->indexer->indexType;
-                        (*astExpectedTypes)[item.value] = expectedTableTy->indexer->indexResultType;
-
-                        TypeId matchedType = matchLiteralType(
-                            astTypes,
-                            astExpectedTypes,
-                            builtinTypes,
-                            arena,
-                            unifier,
-                            expectedTableTy->indexer->indexResultType,
-                            propTy,
-                            item.value,
-                            toBlock
-                        );
-
-                        if (tableTy->indexer)
-                            unifier->unify(matchedType, tableTy->indexer->indexResultType);
-                        else
-                            tableTy->indexer = TableIndexer{expectedTableTy->indexer->indexType, matchedType};
-
-                        tableTy->props.erase(keyStr);
-                    }
-
-                    // If it's just an extra property and the expected type
-                    // has no indexer, there's no work to do here.
-
-                    continue;
+                    // If we see a pattern like:
+                    //
+                    //  local function foo<T>(my_enum: "foo" | "bar" | T) -> T
+                    //      return my_enum
+                    //  end
+                    //  local var = foo("meow")
+                    //
+                    // ... where we are attempting to push a singleton onto any string
+                    // literal, and the lower bound is still a singleton, then snap
+                    // to said lower bound.
+                    solver->bind(constraint, exprType, ft->lowerBound);
+                    return exprType;
                 }
 
-                LUAU_ASSERT(it2 != expectedTableTy->props.end());
-
-                const Property& expectedProp = it2->second;
-
-                std::optional<TypeId> expectedReadTy = expectedProp.readTy;
-                std::optional<TypeId> expectedWriteTy = expectedProp.writeTy;
-
-                TypeId matchedType = nullptr;
-
-                // Important optimization: If we traverse into the read and
-                // write types separately even when they are shared, we go
-                // quadratic in a hurry.
-                if (expectedProp.isShared())
+                // if the upper bound is a subtype of the expected type, we can push the expected type in
+                Relation upperBoundRelation = relate(ft->upperBound, expectedType);
+                if (upperBoundRelation == Relation::Subset || upperBoundRelation == Relation::Coincident)
                 {
-                    matchedType =
-                        matchLiteralType(astTypes, astExpectedTypes, builtinTypes, arena, unifier, *expectedReadTy, propTy, item.value, toBlock);
-                    prop.readTy = matchedType;
-                    prop.writeTy = matchedType;
+                    solver->bind(constraint, exprType, expectedType);
+                    return exprType;
                 }
-                else if (expectedReadTy)
+
+                // likewise, if the lower bound is a subtype, we can force the expected type in
+                // if this is the case and the previous relation failed, it means that the primitive type
+                // constraint was going to have to select the lower bound for this type anyway.
+                Relation lowerBoundRelation = relate(ft->lowerBound, expectedType);
+                if (lowerBoundRelation == Relation::Subset || lowerBoundRelation == Relation::Coincident)
                 {
-                    matchedType =
-                        matchLiteralType(astTypes, astExpectedTypes, builtinTypes, arena, unifier, *expectedReadTy, propTy, item.value, toBlock);
-                    prop.readTy = matchedType;
-                    prop.writeTy.reset();
+                    solver->bind(constraint, exprType, expectedType);
+                    return exprType;
                 }
-                else if (expectedWriteTy)
+            }
+        }
+
+        if (auto exprLambda = expr->as<AstExprFunction>())
+        {
+            const auto lambdaTy = get<FunctionType>(exprType);
+
+            FindFunctionTypeIn ffti{int(exprLambda->args.size)};
+            ffti.run(expectedType);
+            const FunctionType* expectedLambdaTy = ffti.candidate;
+
+            if (lambdaTy && expectedLambdaTy)
+            {
+                const auto& [lambdaArgTys, _lambdaTail] = flatten(lambdaTy->argTypes);
+                const auto& [expectedLambdaArgTys, _expectedLambdaTail] =
+                    extendTypePack(*solver->arena, solver->builtinTypes, expectedLambdaTy->argTypes, exprLambda->args.size);
+
+                auto limit = std::min({lambdaArgTys.size(), expectedLambdaArgTys.size(), exprLambda->args.size});
+                for (size_t argIndex = 0; argIndex < limit; argIndex++)
                 {
-                    matchedType =
-                        matchLiteralType(astTypes, astExpectedTypes, builtinTypes, arena, unifier, *expectedWriteTy, propTy, item.value, toBlock);
-                    prop.readTy.reset();
-                    prop.writeTy = matchedType;
+                    if (!exprLambda->args.data[argIndex]->annotation && get<FreeType>(follow(lambdaArgTys[argIndex])) &&
+                        !containsGeneric(expectedLambdaArgTys[argIndex], NotNull{genericTypesAndPacks}))
+                        solver->bind(NotNull{constraint}, lambdaArgTys[argIndex], expectedLambdaArgTys[argIndex]);
+                }
+
+
+                if (FFlag::LuauBidirectionalInferenceBetterLambdaHandling)
+                {
+                    // When multiple union arms have the same arg count, it's
+                    // ambiguous. Don't bind the return type so the solver can infer
+                    // it from the body.
+                    if (!ffti.ambiguous && !exprLambda->returnAnnotation && get<FreeTypePack>(follow(lambdaTy->retTypes)) &&
+                        !containsGeneric(expectedLambdaTy->retTypes, NotNull{genericTypesAndPacks}))
+                        solver->bind(NotNull{constraint}, lambdaTy->retTypes, expectedLambdaTy->retTypes);
                 }
                 else
                 {
-                    // Also important: It is presently the case that all
-                    // table properties are either read-only, or have the
-                    // same read and write types.
-                    LUAU_ASSERT(!"Should be unreachable");
+                    if (!exprLambda->returnAnnotation && get<FreeTypePack>(follow(lambdaTy->retTypes)) &&
+                        !containsGeneric(expectedLambdaTy->retTypes, NotNull{genericTypesAndPacks}))
+                        solver->bind(NotNull{constraint}, lambdaTy->retTypes, expectedLambdaTy->retTypes);
                 }
-
-                LUAU_ASSERT(prop.readTy || prop.writeTy);
-
-                LUAU_ASSERT(matchedType);
-
-                (*astExpectedTypes)[item.value] = matchedType;
             }
-            else if (item.kind == AstExprTable::Item::List)
-            {
-                LUAU_ASSERT(tableTy->indexer);
+        }
 
-                if (expectedTableTy->indexer)
+
+        // TODO: CLI-169235: This probably ought to use the same logic as
+        // `index` to determine what the type of a given member is.
+        if (auto exprTable = expr->as<AstExprTable>())
+        {
+            const TableType* expectedTableTy = get<TableType>(expectedType);
+
+            if (!expectedTableTy)
+            {
+                if (auto utv = get<UnionType>(expectedType))
                 {
-                    const TypeId* propTy = astTypes->find(item.value);
-                    LUAU_ASSERT(propTy);
-
-                    unifier->unify(expectedTableTy->indexer->indexType, builtinTypes->numberType);
-                    TypeId matchedType = matchLiteralType(
-                        astTypes,
-                        astExpectedTypes,
-                        builtinTypes,
-                        arena,
-                        unifier,
-                        expectedTableTy->indexer->indexResultType,
-                        *propTy,
-                        item.value,
-                        toBlock
-                    );
-
-                    // if the index result type is the prop type, we can replace it with the matched type here.
-                    if (tableTy->indexer->indexResultType == *propTy)
-                        tableTy->indexer->indexResultType = matchedType;
+                    if (FFlag::LuauBidirectionalInferenceSimplifyTables)
+                    {
+                        if (auto tt = extractMatchingTableType(utv, exprType, solver->builtinTypes, solver->arena))
+                            (void)pushType(*tt, expr);
+                    }
+                    else
+                    {
+                        if (auto tt = extractMatchingTableType_DEPRECATED(utv, exprType, solver->builtinTypes))
+                            (void)pushType(*tt, expr);
+                    }
                 }
-            }
-            else if (item.kind == AstExprTable::Item::General)
-            {
-
-                // We have { ..., [blocked] : somePropExpr, ...}
-                // If blocked resolves to a string, we will then take care of this above
-                // If it resolves to some other kind of expression, we don't have a way of folding this information into indexer
-                // because there is no named prop to remove
-                // We should just block here
-                const TypeId* keyTy = astTypes->find(item.key);
-                LUAU_ASSERT(keyTy);
-                TypeId tKey = follow(*keyTy);
-                if (get<BlockedType>(tKey))
-                    toBlock.push_back(tKey);
-
-                const TypeId* propTy = astTypes->find(item.value);
-                LUAU_ASSERT(propTy);
-                TypeId tProp = follow(*propTy);
-                if (get<BlockedType>(tProp))
-                    toBlock.push_back(tProp);
-            }
-            else
-                LUAU_ASSERT(!"Unexpected");
-        }
-
-        // Keys that the expectedType says we should have, but that aren't
-        // specified by the AST fragment.
-        //
-        // If any such keys are options, then we'll add them to the expression
-        // type.
-        //
-        // We use std::optional<std::string> here because the empty string is a
-        // perfectly reasonable value to insert into the set.  We'll use
-        // std::nullopt as our sentinel value.
-        Set<std::optional<std::string>> missingKeys{{}};
-        for (const auto& [name, _] : expectedTableTy->props)
-            missingKeys.insert(name);
-
-        for (const AstExprTable::Item& item : exprTable->items)
-        {
-            if (item.key)
-            {
-                if (const auto str = item.key->as<AstExprConstantString>())
+                else if (auto itv = get<IntersectionType>(expectedType))
                 {
-                    missingKeys.erase(std::string(str->value.data, str->value.size));
+                    for (const auto part : itv)
+                        (void)pushType(part, expr);
+
+                    // Reset the expected type for this expression prior,
+                    // otherwise the expected type will be the last part
+                    // of the intersection, which does not seem ideal.
+                    (*astExpectedTypes)[expr] = expectedType;
                 }
+
+                return exprType;
+            }
+
+            for (const AstExprTable::Item& item : exprTable->items)
+            {
+                if (isRecord(item))
+                {
+                    const AstArray<char>& s = item.key->as<AstExprConstantString>()->value;
+                    std::string keyStr{s.data, s.data + s.size};
+                    auto it = expectedTableTy->props.find(keyStr);
+
+                    if (it == expectedTableTy->props.end())
+                    {
+                        // If we have some type:
+                        //
+                        //  { [T]: U }
+                        //
+                        // ... that we're trying to push into ...
+                        //
+                        //  { foo = bar }
+                        //
+                        // Then the intent is probably to push `U` into `bar`.
+                        if (expectedTableTy->indexer)
+                            (void)pushType(expectedTableTy->indexer->indexResultType, item.value);
+
+                        // If it's just an extra property and the expected type
+                        // has no indexer, there's no work to do here.
+                        continue;
+                    }
+
+                    LUAU_ASSERT(it != expectedTableTy->props.end());
+
+                    const Property& expectedProp = it->second;
+
+                    if (expectedProp.readTy)
+                        (void)pushType(*expectedProp.readTy, item.value);
+
+                    // NOTE: We do *not* add to the potential indexer types here.
+                    // I think this is correct to support something like:
+                    //
+                    //  { [string]: number, foo: boolean }
+                    //
+                    // NOTE: We also do nothing for write properties.
+                }
+                else if (item.kind == AstExprTable::Item::Kind::List)
+                {
+                    if (expectedTableTy->indexer)
+                    {
+                        unifier->unify(expectedTableTy->indexer->indexType, solver->builtinTypes->numberType);
+                        (void)pushType(expectedTableTy->indexer->indexResultType, item.value);
+                    }
+                }
+                else if (item.kind == AstExprTable::Item::Kind::General)
+                {
+
+                    // We have { ..., [blocked] : somePropExpr, ...}
+                    // If blocked resolves to a string, we will then take care of this above
+                    // If it resolves to some other kind of expression, we don't have a way of folding this information into indexer
+                    // because there is no named prop to remove
+                    // We should just block here
+                    if (expectedTableTy->indexer)
+                    {
+                        (void)pushType(expectedTableTy->indexer->indexType, item.key);
+                        (void)pushType(expectedTableTy->indexer->indexResultType, item.value);
+                    }
+                }
+                else
+                    LUAU_ASSERT(!"Unexpected");
             }
         }
 
-        for (const auto& key : missingKeys)
-        {
-            LUAU_ASSERT(key.has_value());
-
-            auto it = expectedTableTy->props.find(*key);
-            LUAU_ASSERT(it != expectedTableTy->props.end());
-
-            const Property& expectedProp = it->second;
-
-            Property exprProp;
-
-            if (expectedProp.readTy && isOptional(*expectedProp.readTy))
-                exprProp.readTy = *expectedProp.readTy;
-            if (expectedProp.writeTy && isOptional(*expectedProp.writeTy))
-                exprProp.writeTy = *expectedProp.writeTy;
-
-            // If the property isn't actually optional, do nothing.
-            if (exprProp.readTy || exprProp.writeTy)
-                tableTy->props[*key] = std::move(exprProp);
-        }
-
-        // If the expected table has an indexer, then the provided table can
-        // have one too.
-        // TODO: If the expected table also has an indexer, we might want to
-        // push the expected indexer's types into it.
-        if (expectedTableTy->indexer && !tableTy->indexer)
-        {
-            tableTy->indexer = expectedTableTy->indexer;
-        }
+        return exprType;
     }
+};
+} // namespace
 
-    return exprType;
+PushTypeResult pushTypeInto(
+    NotNull<DenseHashMap2<const AstExpr*, TypeId>> astTypes,
+    NotNull<DenseHashMap2<const AstExpr*, TypeId>> astExpectedTypes,
+    NotNull<ConstraintSolver> solver,
+    NotNull<const Constraint> constraint,
+    NotNull<DenseHashSet2<const void*>> genericTypesAndPacks,
+    NotNull<Unifier2> unifier,
+    NotNull<Subtyping> subtyping,
+    TypeId expectedType,
+    const AstExpr* expr
+)
+{
+    BidirectionalTypePusher btp{astTypes, astExpectedTypes, solver, constraint, genericTypesAndPacks, unifier, subtyping};
+    (void)btp.pushType(expectedType, expr);
+    return {std::move(btp.incompleteInferences)};
 }
 
 } // namespace Luau

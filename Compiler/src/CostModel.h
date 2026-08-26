@@ -2,15 +2,25 @@
 #pragma once
 
 #include "Luau/Ast.h"
-#include "Luau/DenseHash.h"
+#include "Luau/DenseHash2.h"
 
 namespace Luau
 {
 namespace Compile
 {
 
+struct Constant;
+
 // cost model: 8 bytes, where first byte is the baseline cost, and the next 7 bytes are discounts for when variable #i is constant
-uint64_t modelCost(AstNode* root, AstLocal* const* vars, size_t varCount, const DenseHashMap<AstExprCall*, int>& builtins);
+uint64_t modelCost(
+    AstNode* root,
+    AstLocal* const* vars,
+    size_t varCount,
+    const DenseHashMap2<AstExprCall*, int>& builtins,
+    const DenseHashMap2<AstExpr*, Constant>& constants
+);
+// when additional data is not available, used to test the cost model
+uint64_t modelCost(AstNode* root, AstLocal* const* vars, size_t varCount);
 
 // cost is computed as B - sum(Di * Ci), where B is baseline cost, Di is the discount for each variable and Ci is 1 when variable #i is constant
 int computeCost(uint64_t model, const bool* varsConst, size_t varCount);

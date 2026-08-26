@@ -10,8 +10,6 @@
 #include <unordered_map>
 #include <unordered_set>
 
-LUAU_FASTFLAG(DebugLuauDeferredConstraintResolution);
-
 namespace Luau
 {
 
@@ -37,7 +35,7 @@ struct StateDot
     bool canDuplicatePrimitive(TypeId ty);
 
     void visitChildren(TypeId ty, int index);
-    void visitChildren(TypePackId ty, int index);
+    void visitChildren(TypePackId tp, int index);
 
     void visitChild(TypeId ty, int parentIndex, const char* linkName = nullptr);
     void visitChild(TypePackId tp, int parentIndex, const char* linkName = nullptr);
@@ -188,7 +186,24 @@ void StateDot::visitChildren(TypeId ty, int index)
                 return visitChild(*t.boundTo, index, "boundTo");
 
             for (const auto& [name, prop] : t.props)
-                visitChild(prop.type(), index, name.c_str());
+            {
+                if (prop.isShared())
+                    visitChild(*prop.readTy, index, name.c_str());
+                else
+                {
+                    if (prop.readTy)
+                    {
+                        std::string readName = "read " + name;
+                        visitChild(*prop.readTy, index, readName.c_str());
+                    }
+
+                    if (prop.writeTy)
+                    {
+                        std::string writeName = "write " + name;
+                        visitChild(*prop.writeTy, index, writeName.c_str());
+                    }
+                }
+            }
             if (t.indexer)
             {
                 visitChild(t.indexer->indexType, index, "[index]");
@@ -254,18 +269,21 @@ void StateDot::visitChildren(TypeId ty, int index)
             finishNodeLabel(ty);
             finishNode();
 
-            if (FFlag::DebugLuauDeferredConstraintResolution)
-            {
-                if (!get<NeverType>(t.lowerBound))
-                    visitChild(t.lowerBound, index, "[lowerBound]");
+            if (t.lowerBound && !get<NeverType>(t.lowerBound))
+                visitChild(t.lowerBound, index, "[lowerBound]");
 
-                if (!get<UnknownType>(t.upperBound))
-                    visitChild(t.upperBound, index, "[upperBound]");
-            }
+            if (t.upperBound && !get<UnknownType>(t.upperBound))
+                visitChild(t.upperBound, index, "[upperBound]");
         }
         else if constexpr (std::is_same_v<T, AnyType>)
         {
             formatAppend(result, "AnyType %d", index);
+            finishNodeLabel(ty);
+            finishNode();
+        }
+        else if constexpr (std::is_same_v<T, NoRefineType>)
+        {
+            formatAppend(result, "NoRefineType %d", index);
             finishNodeLabel(ty);
             finishNode();
         }
@@ -293,14 +311,31 @@ void StateDot::visitChildren(TypeId ty, int index)
             finishNodeLabel(ty);
             finishNode();
         }
-        else if constexpr (std::is_same_v<T, ClassType>)
+        else if constexpr (std::is_same_v<T, ExternType>)
         {
-            formatAppend(result, "ClassType %s", t.name.c_str());
+            formatAppend(result, "ExternType %s", t.name.c_str());
             finishNodeLabel(ty);
             finishNode();
 
             for (const auto& [name, prop] : t.props)
-                visitChild(prop.type(), index, name.c_str());
+            {
+                if (prop.isShared())
+                    visitChild(*prop.readTy, index, name.c_str());
+                else
+                {
+                    if (prop.readTy)
+                    {
+                        std::string readName = "read " + name;
+                        visitChild(*prop.readTy, index, readName.c_str());
+                    }
+
+                    if (prop.writeTy)
+                    {
+                        std::string writeName = "write " + name;
+                        visitChild(*prop.writeTy, index, writeName.c_str());
+                    }
+                }
+            }
 
             if (t.parent)
                 visitChild(*t.parent, index, "[parent]");
@@ -399,7 +434,7 @@ void StateDot::visitChildren(TypePackId tp, int index)
 
         visitChild(vtp->ty, index);
     }
-    else if (const FreeTypePack* ftp = get<FreeTypePack>(tp))
+    else if (get<FreeTypePack>(tp))
     {
         formatAppend(result, "FreeTypePack %d", index);
         finishNodeLabel(tp);
@@ -414,7 +449,7 @@ void StateDot::visitChildren(TypePackId tp, int index)
         finishNodeLabel(tp);
         finishNode();
     }
-    else if (get<Unifiable::Error>(tp))
+    else if (get<ErrorTypePack>(tp))
     {
         formatAppend(result, "ErrorTypePack %d", index);
         finishNodeLabel(tp);

@@ -15,8 +15,13 @@
 #include "lstring.h"
 #include "ltable.h"
 #include "ludata.h"
+#include "lvector.h"
 
 #include <string.h>
+
+LUAU_FASTFLAG(LuauDirectFieldGet)
+LUAU_FASTFLAG(LuauCIProto)
+LUAU_FASTFLAG(LuauPromoteProto)
 
 // All external function calls that can cause stack realloc or Lua calls have to be wrapped in VM_PROTECT
 // This makes sure that we save the pc (in case the Lua call needs to generate a backtrace) before the call,
@@ -36,7 +41,7 @@
 #define VM_PROTECT_PC() L->ci->savedpc = pc
 
 #define VM_REG(i) (LUAU_ASSERT(unsigned(i) < unsigned(L->top - base)), &base[i])
-#define VM_KV(i) (LUAU_ASSERT(unsigned(i) < unsigned(cl->l.p->sizek)), &k[i])
+#define VM_KV(i) (LUAU_ASSERT(unsigned(i) < unsigned((FFlag::LuauCIProto ? L->ci->p : cl->l.p)->sizek)), &k[i])
 #define VM_UV(i) (LUAU_ASSERT(unsigned(i) < unsigned(cl->nupvalues)), &cl->l.uprefs[i])
 
 #define VM_PATCH_C(pc, slot) *const_cast<Instruction*>(pc) = ((uint8_t(slot) << 24) | (0x00ffffffu & *(pc)))
@@ -61,7 +66,7 @@ namespace Luau
 namespace CodeGen
 {
 
-bool forgLoopTableIter(lua_State* L, Table* h, int index, TValue* ra)
+bool forgLoopTableIter(lua_State* L, LuaTable* h, int index, TValue* ra)
 {
     int sizearray = h->sizearray;
 
@@ -104,7 +109,7 @@ bool forgLoopTableIter(lua_State* L, Table* h, int index, TValue* ra)
     return false;
 }
 
-bool forgLoopNodeIter(lua_State* L, Table* h, int index, TValue* ra)
+bool forgLoopNodeIter(lua_State* L, LuaTable* h, int index, TValue* ra)
 {
     int sizearray = h->sizearray;
     int sizenode = 1 << h->lsizenode;
@@ -129,7 +134,35 @@ bool forgLoopNodeIter(lua_State* L, Table* h, int index, TValue* ra)
     return false;
 }
 
-bool forgLoopNonTableFallback(lua_State* L, int insnA, int aux)
+int forgLoopNonTableFallback(lua_State* L, int insnA, int aux)
+{
+    TValue* base = L->base;
+    TValue* ra = VM_REG(insnA);
+
+    // note: it's safe to push arguments past top for complicated reasons (see lvmexecute.cpp)
+    setobj2s(L, ra + 3 + 2, ra + 2);
+    setobj2s(L, ra + 3 + 1, ra + 1);
+    setobj2s(L, ra + 3, ra);
+
+    L->top = ra + 3 + 3; // func + 2 args (state and index)
+    LUAU_ASSERT(L->top <= L->stack_last);
+
+    if (luaD_performcally(L, ra + 3, uint8_t(aux)))
+        return -1; // yield/break, caller must exit native execution
+
+    L->top = L->ci->top;
+
+    // recompute ra since stack might have been reallocated
+    base = L->base;
+    ra = VM_REG(insnA);
+
+    // copy first variable back into the iteration index
+    setobj2s(L, ra + 2, ra + 3);
+
+    return ttisnil(ra + 3) ? 0 : 1;
+}
+
+bool forgLoopNonTableFallback_DEPRECATED(lua_State* L, int insnA, int aux)
 {
     TValue* base = L->base;
     TValue* ra = VM_REG(insnA);
@@ -159,8 +192,13 @@ void forgPrepXnextFallback(lua_State* L, TValue* ra, int pc)
 {
     if (!ttisfunction(ra))
     {
-        Closure* cl = clvalue(L->ci->func);
-        L->ci->savedpc = cl->l.p->code + pc;
+        if (FFlag::LuauCIProto)
+            L->ci->savedpc = L->ci->p->code + pc;
+        else
+        {
+            Closure* cl = clvalue(L->ci->func);
+            L->ci->savedpc = cl->l.p->code + pc;
+        }
 
         luaG_typeerror(L, ra, "iterate over");
     }
@@ -178,6 +216,8 @@ Closure* callProlog(lua_State* L, TValue* ra, StkId argtop, int nresults)
     Closure* ccl = clvalue(ra);
 
     CallInfo* ci = incr_ci(L);
+    if (FFlag::LuauCIProto)
+        ci->p = getproto(ccl);
     ci->func = ra;
     ci->base = ra + 1;
     ci->top = argtop + ccl->stacksize; // note: technically UB since we haven't reallocated the stack yet
@@ -191,7 +231,7 @@ Closure* callProlog(lua_State* L, TValue* ra, StkId argtop, int nresults)
     // note: this reallocs stack, but we don't need to VM_PROTECT this
     // this is because we're going to modify base/savedpc manually anyhow
     // crucially, we can't use ra/argtop after this line
-    luaD_checkstack(L, ccl->stacksize);
+    luaD_checkstackfornewci(L, ccl->stacksize);
 
     return ccl;
 }
@@ -224,14 +264,38 @@ Udata* newUserdata(lua_State* L, size_t s, int tag)
 {
     Udata* u = luaU_newudata(L, s, tag);
 
-    if (Table* h = L->global->udatamt[tag])
+    if (LuaTable* h = L->global->udatamt[tag])
     {
-        u->metatable = h;
+        // currently, we always allocate unmarked objects, so forward barrier can be skipped
+        LUAU_ASSERT(!isblack(obj2gco(u)));
 
-        luaC_objbarrier(L, u, h);
+        u->metatable = h;
     }
 
     return u;
+}
+
+LuauVector* newVector(lua_State* L, double x, double y, double z)
+{
+    return luaVec_newvector(L, x, y, z, 0.0);
+}
+
+void getImport(lua_State* L, StkId res, unsigned id, unsigned pc)
+{
+    if (FFlag::LuauCIProto)
+    {
+        Proto* p = L->ci->p;
+        L->ci->savedpc = p->code + pc;
+
+        luaV_getimport(L, clvalue(L->ci->func)->env, p->k, res, id, /*propagatenil*/ false);
+    }
+    else
+    {
+        Closure* cl = clvalue(L->ci->func);
+        L->ci->savedpc = cl->l.p->code + pc;
+
+        luaV_getimport(L, cl->env, cl->l.p->k, res, id, /*propagatenil*/ false);
+    }
 }
 
 // Extracted as-is from lvmexecute.cpp with the exception of control flow (reentry) and removed interrupts/savedpc
@@ -247,6 +311,8 @@ Closure* callFallback(lua_State* L, StkId ra, StkId argtop, int nresults)
     Closure* ccl = clvalue(ra);
 
     CallInfo* ci = incr_ci(L);
+    if (FFlag::LuauCIProto)
+        ci->p = getproto(ccl);
     ci->func = ra;
     ci->base = ra + 1;
     ci->top = argtop + ccl->stacksize; // note: technically UB since we haven't reallocated the stack yet
@@ -260,7 +326,7 @@ Closure* callFallback(lua_State* L, StkId ra, StkId argtop, int nresults)
     // note: this reallocs stack, but we don't need to VM_PROTECT this
     // this is because we're going to modify base/savedpc manually anyhow
     // crucially, we can't use ra/argtop after this line
-    luaD_checkstack(L, ccl->stacksize);
+    luaD_checkstackfornewci(L, ccl->stacksize);
 
     LUAU_ASSERT(ci->top <= L->stack_last);
 
@@ -278,7 +344,7 @@ Closure* callFallback(lua_State* L, StkId ra, StkId argtop, int nresults)
         // keep executing new function
         ci->savedpc = p->code;
 
-        if (LUAU_LIKELY(p->execdata != NULL))
+        if (LUAU_LIKELY(p->exectarget != 0))
             ci->flags = LUA_CALLINFO_NATIVE;
 
         return ccl;
@@ -318,6 +384,40 @@ Closure* callFallback(lua_State* L, StkId ra, StkId argtop, int nresults)
     }
 }
 
+int fastPcallSetup(lua_State* L, StkId ra, int pfid, int nparams, int nresults)
+{
+    LUAU_ASSERT(pfid == 0 || pfid == 1);
+
+    if (nparams == LUA_MULTRET)
+        nparams = int(L->top - (ra + 1));
+
+    setclvalue(L, ra, pfid == 0 ? L->global->builtinPcall : L->global->builtinXpcall);
+
+    int errfunc = pfid; // for current supported functions this happens to match
+
+    L->top = ra + 1 + nparams;
+
+    luau_pushhandlerci(L, ra, errfunc, nresults);
+
+    StkId callerfunc = L->ci->base + errfunc;
+    int calleeresults = (nresults > 0) ? nresults - 1 : nresults;
+    int pr = luau_precall(L, callerfunc, calleeresults);
+
+    if (pr == PCRLUA)
+    {
+        L->ci->flags |= LUA_CALLINFO_RETURN;
+        return 0;
+    }
+    else if (pr == PCRC)
+    {
+        luau_pospcallsuccess(L);
+        return -1;
+    }
+
+    LUAU_ASSERT(pr == PCRYIELD);
+    return 1;
+}
+
 const Instruction* executeGETGLOBAL(lua_State* L, const Instruction* pc, StkId base, TValue* k)
 {
     [[maybe_unused]] Closure* cl = clvalue(L->ci->func);
@@ -328,7 +428,7 @@ const Instruction* executeGETGLOBAL(lua_State* L, const Instruction* pc, StkId b
     LUAU_ASSERT(ttisstring(kv));
 
     // fast-path should already have been checked, so we skip checking for it here
-    Table* h = cl->env;
+    LuaTable* h = cl->env;
     int slot = LUAU_INSN_C(insn) & h->nodemask8;
 
     // slow-path, may invoke Lua calls via __index metamethod
@@ -351,7 +451,7 @@ const Instruction* executeSETGLOBAL(lua_State* L, const Instruction* pc, StkId b
     LUAU_ASSERT(ttisstring(kv));
 
     // fast-path should already have been checked, so we skip checking for it here
-    Table* h = cl->env;
+    LuaTable* h = cl->env;
     int slot = LUAU_INSN_C(insn) & h->nodemask8;
 
     // slow-path, may invoke Lua calls via __newindex metamethod
@@ -368,16 +468,17 @@ const Instruction* executeGETTABLEKS(lua_State* L, const Instruction* pc, StkId 
 {
     [[maybe_unused]] Closure* cl = clvalue(L->ci->func);
     Instruction insn = *pc++;
+    int op = LUAU_INSN_OP(insn);
     StkId ra = VM_REG(LUAU_INSN_A(insn));
     StkId rb = VM_REG(LUAU_INSN_B(insn));
     uint32_t aux = *pc++;
-    TValue* kv = VM_KV(aux);
+    TValue* kv = VM_KV(op == LOP_GETUDATAKS ? LUAU_INSN_AUX_KV16(aux) : aux);
     LUAU_ASSERT(ttisstring(kv));
 
     // fast-path: built-in table
     if (ttistable(rb))
     {
-        Table* h = hvalue(rb);
+        LuaTable* h = hvalue(rb);
 
         // we ignore the fast path that checks for the cached slot since IrTranslation already checks for it.
 
@@ -409,6 +510,43 @@ const Instruction* executeGETTABLEKS(lua_State* L, const Instruction* pc, StkId 
     }
     else
     {
+        // fast-path: registered direct field handler
+        if (FFlag::LuauDirectFieldGet && ttisuserdata(rb))
+        {
+            LuaTable* dispatch = L->global->udatadirectfields[uvalue(rb)->tag];
+            if (dispatch)
+            {
+                int slot = LUAU_INSN_C(insn) & dispatch->nodemask8;
+                LuaNode* n = &dispatch->node[slot];
+
+#if LUA_VECTOR_DOUBLE == 1
+                DirectFieldResult dfr{L, ra};
+                void* resultarg = &dfr;
+#else
+                void* resultarg = ra;
+#endif
+
+                if (LUAU_LIKELY(ttisstring(gkey(n)) && tsvalue(gkey(n)) == tsvalue(kv) && !ttisnil(gval(n))))
+                {
+                    lua_UserdataDirectFieldGet fn = reinterpret_cast<lua_UserdataDirectFieldGet>(pvalue(gval(n)));
+                    fn(uvalue(rb)->data, resultarg);
+                    return pc;
+                }
+
+                const TValue* fptr = luaH_getstr(dispatch, tsvalue(kv));
+                if (!ttisnil(fptr))
+                {
+                    // cache slot for future lookups
+                    VM_PATCH_C(pc - 2, gval2slot(dispatch, fptr));
+                    lua_UserdataDirectFieldGet fn = reinterpret_cast<lua_UserdataDirectFieldGet>(pvalue(fptr));
+                    fn(uvalue(rb)->data, resultarg);
+                    return pc;
+                }
+            }
+
+            // fall through to slow path
+        }
+
         // fast-path: user data with C __index TM
         const TValue* fn = 0;
         if (ttisuserdata(rb) && (fn = fasttm(L, uvalue(rb)->metatable, TM_INDEX)) && ttisfunction(fn) && clvalue(fn)->isC)
@@ -441,7 +579,7 @@ const Instruction* executeGETTABLEKS(lua_State* L, const Instruction* pc, StkId 
 
             if (unsigned(ic) < LUA_VECTOR_SIZE && name[1] == '\0')
             {
-                const float* v = vvalue(rb); // silences ubsan when indexing v[]
+                const LUA_VECTOR_TYPE* v = vvalue(rb); // silences ubsan when indexing v[]
                 setnvalue(ra, v[ic]);
                 return pc;
             }
@@ -480,16 +618,17 @@ const Instruction* executeSETTABLEKS(lua_State* L, const Instruction* pc, StkId 
 {
     [[maybe_unused]] Closure* cl = clvalue(L->ci->func);
     Instruction insn = *pc++;
+    int op = LUAU_INSN_OP(insn);
     StkId ra = VM_REG(LUAU_INSN_A(insn));
     StkId rb = VM_REG(LUAU_INSN_B(insn));
     uint32_t aux = *pc++;
-    TValue* kv = VM_KV(aux);
+    TValue* kv = VM_KV(op == LOP_SETUDATAKS ? LUAU_INSN_AUX_KV16(aux) : aux);
     LUAU_ASSERT(ttisstring(kv));
 
     // fast-path: built-in table
     if (ttistable(rb))
     {
-        Table* h = hvalue(rb);
+        LuaTable* h = hvalue(rb);
 
         // we ignore the fast path that checks for the cached slot since IrTranslation already checks for it.
 
@@ -550,10 +689,11 @@ const Instruction* executeNAMECALL(lua_State* L, const Instruction* pc, StkId ba
 {
     [[maybe_unused]] Closure* cl = clvalue(L->ci->func);
     Instruction insn = *pc++;
+    int op = LUAU_INSN_OP(insn);
     StkId ra = VM_REG(LUAU_INSN_A(insn));
     StkId rb = VM_REG(LUAU_INSN_B(insn));
     uint32_t aux = *pc++;
-    TValue* kv = VM_KV(aux);
+    TValue* kv = VM_KV(op == LOP_NAMECALLUDATA ? LUAU_INSN_AUX_KV16(aux) : aux);
     LUAU_ASSERT(ttisstring(kv));
 
     if (ttistable(rb))
@@ -574,7 +714,7 @@ const Instruction* executeNAMECALL(lua_State* L, const Instruction* pc, StkId ba
     }
     else
     {
-        Table* mt = ttisuserdata(rb) ? uvalue(rb)->metatable : L->global->mt[ttype(rb)];
+        LuaTable* mt = ttisuserdata(rb) ? uvalue(rb)->metatable : L->global->mt[ttype(rb)];
         const TValue* tmi = 0;
 
         // fast-path: metatable with __namecall
@@ -588,7 +728,7 @@ const Instruction* executeNAMECALL(lua_State* L, const Instruction* pc, StkId ba
         }
         else if ((tmi = fasttm(L, mt, TM_INDEX)) && ttistable(tmi))
         {
-            Table* h = hvalue(tmi);
+            LuaTable* h = hvalue(tmi);
             int slot = LUAU_INSN_C(insn) & h->nodemask8;
             LuaNode* n = &h->node[slot];
 
@@ -626,7 +766,7 @@ const Instruction* executeNAMECALL(lua_State* L, const Instruction* pc, StkId ba
     }
 
     // intentional fallthrough to CALL
-    LUAU_ASSERT(LUAU_INSN_OP(*pc) == LOP_CALL);
+    LUAU_ASSERT(LUAU_INSN_OP(*pc) == LOP_CALL || LUAU_INSN_OP(*pc) == LOP_CALLFB);
     return pc;
 }
 
@@ -645,7 +785,7 @@ const Instruction* executeSETLIST(lua_State* L, const Instruction* pc, StkId bas
         L->top = L->ci->top;
     }
 
-    Table* h = hvalue(ra);
+    LuaTable* h = hvalue(ra);
 
     // TODO: we really don't need this anymore
     if (!ttistable(ra))
@@ -680,7 +820,7 @@ const Instruction* executeFORGPREP(lua_State* L, const Instruction* pc, StkId ba
     }
     else
     {
-        Table* mt = ttistable(ra) ? hvalue(ra)->metatable : ttisuserdata(ra) ? uvalue(ra)->metatable : cast_to(Table*, NULL);
+        LuaTable* mt = ttistable(ra) ? hvalue(ra)->metatable : ttisuserdata(ra) ? uvalue(ra)->metatable : cast_to(LuaTable*, NULL);
 
         if (const TValue* fn = fasttm(L, mt, TM_ITER))
         {
@@ -723,14 +863,14 @@ const Instruction* executeFORGPREP(lua_State* L, const Instruction* pc, StkId ba
     }
 
     pc += LUAU_INSN_D(insn);
-    LUAU_ASSERT(unsigned(pc - cl->l.p->code) < unsigned(cl->l.p->sizecode));
+    LUAU_ASSERT(unsigned(pc - (FFlag::LuauCIProto ? L->ci->p : cl->l.p)->code) < unsigned((FFlag::LuauCIProto ? L->ci->p : cl->l.p)->sizecode));
     return pc;
 }
 
 void executeGETVARARGSMultRet(lua_State* L, const Instruction* pc, StkId base, int rai)
 {
     [[maybe_unused]] Closure* cl = clvalue(L->ci->func);
-    int n = cast_int(base - L->ci->func) - cl->l.p->numparams - 1;
+    int n = cast_int(base - L->ci->func) - (FFlag::LuauCIProto ? L->ci->p : cl->l.p)->numparams - 1;
 
     VM_PROTECT(luaD_checkstack(L, n));
     StkId ra = VM_REG(rai); // previous call may change the stack
@@ -744,7 +884,7 @@ void executeGETVARARGSMultRet(lua_State* L, const Instruction* pc, StkId base, i
 void executeGETVARARGSConst(lua_State* L, StkId base, int rai, int b)
 {
     [[maybe_unused]] Closure* cl = clvalue(L->ci->func);
-    int n = cast_int(base - L->ci->func) - cl->l.p->numparams - 1;
+    int n = cast_int(base - L->ci->func) - (FFlag::LuauCIProto ? L->ci->p : cl->l.p)->numparams - 1;
 
     StkId ra = VM_REG(rai);
 
@@ -767,7 +907,7 @@ const Instruction* executeDUPCLOSURE(lua_State* L, const Instruction* pc, StkId 
 
     // clone closure if the environment is not shared
     // note: we save closure to stack early in case the code below wants to capture it by value
-    Closure* ncl = (kcl->env == cl->env) ? kcl : luaF_newLclosure(L, kcl->nupvalues, cl->env, kcl->l.p);
+    Closure* ncl = (kcl->env == cl->env) ? kcl : luaF_newLclosure(L, kcl->nupvalues, cl->env, FFlag::LuauCIProto ? getproto(kcl) : kcl->l.p);
     setclvalue(L, ra, ncl);
 
     // this loop does three things:
@@ -790,7 +930,7 @@ const Instruction* executeDUPCLOSURE(lua_State* L, const Instruction* pc, StkId 
         // lazily clone the closure and update the upvalues
         if (ncl == kcl && kcl->preload == 0)
         {
-            ncl = luaF_newLclosure(L, kcl->nupvalues, cl->env, kcl->l.p);
+            ncl = luaF_newLclosure(L, kcl->nupvalues, cl->env, FFlag::LuauCIProto ? getproto(kcl) : kcl->l.p);
             setclvalue(L, ra, ncl);
 
             ui = -1; // restart the loop to fill all upvalues

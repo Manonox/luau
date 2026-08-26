@@ -2,10 +2,12 @@
 #pragma once
 
 #include "Luau/Ast.h" // Used for some of the enumerations
-#include "Luau/DenseHash.h"
+#include "Luau/DenseHash2.h"
 #include "Luau/NotNull.h"
 #include "Luau/Variant.h"
 #include "Luau/TypeFwd.h"
+#include "Luau/TypeIds.h"
+#include "Luau/VisitType.h"
 
 #include <string>
 #include <memory>
@@ -49,7 +51,13 @@ struct GeneralizationConstraint
     TypeId generalizedType;
     TypeId sourceType;
 
-    std::vector<TypeId> interiorTypes;
+    /// Potentially null pointer to a deprecated attribute. Used to attach
+    /// deprecation info to the generalized function type.
+    AstAttr* maybeDeprecatedAttr;
+
+    /// If true, never introduce generics.  Always replace free types by their
+    /// bounds or unknown. Presently used only to generalize the whole module.
+    bool noGenerics = false;
 };
 
 // variables ~ iterate iterator
@@ -60,7 +68,7 @@ struct IterableConstraint
     std::vector<TypeId> variables;
 
     const AstNode* nextAstFragment;
-    DenseHashMap<const AstNode*, TypeId>* astForInNextTypes;
+    DenseHashMap2<const AstNode*, TypeId>* astForInNextTypes;
 };
 
 // name(namedType) = name
@@ -85,12 +93,21 @@ struct FunctionCallConstraint
     TypeId fn;
     TypePackId argsPack;
     TypePackId result;
+
+    // callSite can be nullptr in the case that this constraint was
+    // synthetically generated from some other constraint. eg
+    // IterableConstraint.
     class AstExprCall* callSite = nullptr;
     std::vector<std::optional<TypeId>> discriminantTypes;
 
+    std::vector<TypeId> typeArguments;
+    std::vector<TypePackId> typePackArguments;
+
+    DenseHashMap2<const AstExpr*, TypeId>* astTypes = nullptr;
+
     // When we dispatch this constraint, we update the key at this map to record
     // the overload that we selected.
-    DenseHashMap<const AstNode*, TypeId>* astOverloadResolvedTypes = nullptr;
+    DenseHashMap2<const AstNode*, TypeId>* astOverloadResolvedTypes = nullptr;
 };
 
 // function_check fn argsPack
@@ -105,8 +122,8 @@ struct FunctionCheckConstraint
     TypePackId argsPack;
 
     class AstExprCall* callSite = nullptr;
-    NotNull<DenseHashMap<const AstExpr*, TypeId>> astTypes;
-    NotNull<DenseHashMap<const AstExpr*, TypeId>> astExpectedTypes;
+    NotNull<DenseHashMap2<const AstExpr*, TypeId>> astTypes;
+    NotNull<DenseHashMap2<const AstExpr*, TypeId>> astExpectedTypes;
 };
 
 // prim FreeType ExpectedType PrimitiveType
@@ -122,7 +139,9 @@ struct FunctionCheckConstraint
 // then FreeType is replaced by its lower bound
 //
 // else FreeType is replaced by PrimitiveType
-struct PrimitiveTypeConstraint
+//
+// Clip with LuauRemovePrimitiveTypeConstraint
+struct DEPRECATED_PrimitiveTypeConstraint
 {
     TypeId freeType;
 
@@ -256,6 +275,50 @@ struct ReducePackConstraint
     TypePackId tp;
 };
 
+// simplify ty
+struct SimplifyConstraint
+{
+    TypeId ty;
+};
+
+// push_function_type_constraint expectedFunctionType => functionType
+//
+// Attempt to "push" the types of `expectedFunctionType` into `functionType`,
+// assuming that `expr` is a lambda who's un-generalized type is `functionType`.
+// Similar to `FunctionCheckConstraint`. For example:
+//
+//  local Foo = {} :: { bar : (number) -> () }
+//
+//  function Foo.bar(x) end
+//
+// This will force `x` to be inferred as `number`.
+struct PushFunctionTypeConstraint
+{
+    TypeId expectedFunctionType;
+    TypeId functionType;
+    NotNull<AstExprFunction> expr;
+    bool isSelf;
+};
+
+// Binds the function to a set of explicitly specified types,
+// for f<<T>>.
+struct TypeInstantiationConstraint
+{
+    TypeId functionType;
+    TypeId placeholderType;
+    std::vector<TypeId> typeArguments;
+    std::vector<TypePackId> typePackArguments;
+};
+
+struct PushTypeConstraint
+{
+    TypeId expectedType;
+    TypeId targetType;
+    NotNull<DenseHashMap2<const AstExpr*, TypeId>> astTypes;
+    NotNull<DenseHashMap2<const AstExpr*, TypeId>> astExpectedTypes;
+    NotNull<const AstExpr> expr;
+};
+
 using ConstraintV = Variant<
     SubtypeConstraint,
     PackSubtypeConstraint,
@@ -265,7 +328,7 @@ using ConstraintV = Variant<
     TypeAliasExpansionConstraint,
     FunctionCallConstraint,
     FunctionCheckConstraint,
-    PrimitiveTypeConstraint,
+    DEPRECATED_PrimitiveTypeConstraint,
     HasPropConstraint,
     HasIndexerConstraint,
     AssignPropConstraint,
@@ -273,11 +336,16 @@ using ConstraintV = Variant<
     UnpackConstraint,
     ReduceConstraint,
     ReducePackConstraint,
-    EqualityConstraint>;
+    EqualityConstraint,
+    SimplifyConstraint,
+    PushFunctionTypeConstraint,
+    PushTypeConstraint,
+    TypeInstantiationConstraint>;
 
 struct Constraint
 {
     Constraint(NotNull<Scope> scope, const Location& location, ConstraintV&& c);
+    Constraint(NotNull<Scope> scope, const Location& location, ConstraintV&& c, std::shared_ptr<ModuleName> moduleName);
 
     Constraint(const Constraint&) = delete;
     Constraint& operator=(const Constraint&) = delete;
@@ -285,14 +353,18 @@ struct Constraint
     NotNull<Scope> scope;
     Location location;
     ConstraintV c;
+    std::shared_ptr<ModuleName> moduleName;
 
-    std::vector<NotNull<Constraint>> dependencies;
-
-    DenseHashSet<TypeId> getMaybeMutatedFreeTypes() const;
+    /**
+     * Return the types and type packs that may be mutated by this constraint.
+     * Currently we do not do anything with type packs.
+     */
+    std::pair<TypeIds, TypePackIds> getMaybeMutatedTypes() const;
 };
 
 using ConstraintPtr = std::unique_ptr<Constraint>;
 
+bool isReferenceCountedType(TypePackId tp);
 bool isReferenceCountedType(const TypeId typ);
 
 inline Constraint& asMutable(const Constraint& c)
@@ -311,5 +383,29 @@ const T* get(const Constraint& c)
 {
     return getMutable<T>(asMutable(c));
 }
+
+struct ReferenceCountInitializer : TypeOnceVisitor
+{
+    NotNull<TypeIds> mutatedTypes;
+    TypePackIds* mutatedTypePacks;
+    bool traverseIntoTypeFunctions = true;
+
+    explicit ReferenceCountInitializer(NotNull<TypeIds> mutatedTypes, NotNull<TypePackIds> mutatedTypePacks);
+
+    bool visit(TypeId ty, const FreeType&) override;
+
+    bool visit(TypeId ty, const BlockedType&) override;
+
+    bool visit(TypeId ty, const PendingExpansionType&) override;
+
+    bool visit(TypeId ty, const TableType& tt) override;
+
+    bool visit(TypeId ty, const ExternType&) override;
+
+    bool visit(TypeId, const TypeFunctionInstanceType& tfit) override;
+
+    bool visit(TypePackId tp, const BlockedTypePack&) override;
+    bool visit(TypePackId tp, const FreeTypePack&) override;
+};
 
 } // namespace Luau

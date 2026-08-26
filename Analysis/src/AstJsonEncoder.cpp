@@ -8,7 +8,7 @@
 
 #include <math.h>
 
-LUAU_FASTFLAG(LuauDeclarationExtraPropData)
+LUAU_FASTFLAG(LuauTrackPrefixLocal)
 
 namespace Luau
 {
@@ -133,21 +133,40 @@ struct AstJsonEncoder : public AstVisitor
 
     void writeString(std::string_view sv)
     {
-        // TODO escape more accurately?
         writeRaw("\"");
 
         for (char c : sv)
         {
-            if (c == '"')
+            switch (c)
+            {
+            case '"':
                 writeRaw("\\\"");
-            else if (c == '\\')
+                break;
+            case '\\':
                 writeRaw("\\\\");
-            else if (c < ' ')
-                writeRaw(format("\\u%04x", c));
-            else if (c == '\n')
+                break;
+            case '\b':
+                writeRaw("\\b");
+                break;
+            case '\f':
+                writeRaw("\\f");
+                break;
+            case '\n':
                 writeRaw("\\n");
-            else
-                writeRaw(c);
+                break;
+            case '\r':
+                writeRaw("\\r");
+                break;
+            case '\t':
+                writeRaw("\\t");
+                break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20)
+                    writeRaw(format("\\u%04x", static_cast<unsigned char>(c)));
+                else
+                    writeRaw(c);
+                break;
+            }
         }
 
         writeRaw("\"");
@@ -243,6 +262,7 @@ struct AstJsonEncoder : public AstVisitor
         else
             write("luauType", nullptr);
         write("name", local->name);
+        write("isConst", local->isConst);
         writeType("AstLocal");
         write("location", local->location);
         popComma(c);
@@ -305,6 +325,18 @@ struct AstJsonEncoder : public AstVisitor
         writeNode(
             node,
             "AstExprConstantNumber",
+            [&]()
+            {
+                write("value", node->value);
+            }
+        );
+    }
+
+    void write(class AstExprConstantInteger* node)
+    {
+        writeNode(
+            node,
+            "AstExprConstantInteger",
             [&]()
             {
                 write("value", node->value);
@@ -427,6 +459,7 @@ struct AstJsonEncoder : public AstVisitor
             "AstExprFunction",
             [&]()
             {
+                PROP(attributes);
                 PROP(generics);
                 PROP(genericPacks);
                 if (node->self)
@@ -466,26 +499,26 @@ struct AstJsonEncoder : public AstVisitor
         writeRaw("}");
     }
 
-    void write(const AstGenericType& genericType)
+    void write(class AstGenericType* genericType)
     {
         writeRaw("{");
         bool c = pushComma();
         writeType("AstGenericType");
-        write("name", genericType.name);
-        if (genericType.defaultValue)
-            write("luauType", genericType.defaultValue);
+        write("name", genericType->name);
+        if (genericType->defaultValue)
+            write("luauType", genericType->defaultValue);
         popComma(c);
         writeRaw("}");
     }
 
-    void write(const AstGenericTypePack& genericTypePack)
+    void write(class AstGenericTypePack* genericTypePack)
     {
         writeRaw("{");
         bool c = pushComma();
         writeType("AstGenericTypePack");
-        write("name", genericTypePack.name);
-        if (genericTypePack.defaultValue)
-            write("luauType", genericTypePack.defaultValue);
+        write("name", genericTypePack->name);
+        if (genericTypePack->defaultValue)
+            write("luauType", genericTypePack->defaultValue);
         popComma(c);
         writeRaw("}");
     }
@@ -494,11 +527,11 @@ struct AstJsonEncoder : public AstVisitor
     {
         switch (kind)
         {
-        case AstExprTable::Item::List:
+        case AstExprTable::Item::Kind::List:
             return writeString("item");
-        case AstExprTable::Item::Record:
+        case AstExprTable::Item::Kind::Record:
             return writeString("record");
-        case AstExprTable::Item::General:
+        case AstExprTable::Item::Kind::General:
             return writeString("general");
         }
     }
@@ -511,7 +544,7 @@ struct AstJsonEncoder : public AstVisitor
         write("kind", item.kind);
         switch (item.kind)
         {
-        case AstExprTable::Item::List:
+        case AstExprTable::Item::Kind::List:
             write("value", item.value);
             break;
         default:
@@ -568,11 +601,11 @@ struct AstJsonEncoder : public AstVisitor
     {
         switch (op)
         {
-        case AstExprUnary::Not:
+        case AstExprUnary::Op::Not:
             return writeString("Not");
-        case AstExprUnary::Minus:
+        case AstExprUnary::Op::Minus:
             return writeString("Minus");
-        case AstExprUnary::Len:
+        case AstExprUnary::Op::Len:
             return writeString("Len");
         }
     }
@@ -883,7 +916,7 @@ struct AstJsonEncoder : public AstVisitor
                 PROP(name);
                 PROP(generics);
                 PROP(genericPacks);
-                PROP(type);
+                write("value", node->type);
                 PROP(exported);
             }
         );
@@ -896,21 +929,13 @@ struct AstJsonEncoder : public AstVisitor
             "AstStatDeclareFunction",
             [&]()
             {
-                // TODO: attributes
+                PROP(attributes);
                 PROP(name);
-
-                if (FFlag::LuauDeclarationExtraPropData)
-                    PROP(nameLocation);
-
+                PROP(nameLocation);
                 PROP(params);
-
-                if (FFlag::LuauDeclarationExtraPropData)
-                {
-                    PROP(paramNames);
-                    PROP(vararg);
-                    PROP(varargLocation);
-                }
-
+                PROP(paramNames);
+                PROP(vararg);
+                PROP(varargLocation);
                 PROP(retTypes);
                 PROP(generics);
                 PROP(genericPacks);
@@ -926,35 +951,26 @@ struct AstJsonEncoder : public AstVisitor
             [&]()
             {
                 PROP(name);
-
-                if (FFlag::LuauDeclarationExtraPropData)
-                    PROP(nameLocation);
-
+                PROP(nameLocation);
                 PROP(type);
             }
         );
     }
 
-    void write(const AstDeclaredClassProp& prop)
+    void write(const AstDeclaredExternTypeProperty& prop)
     {
         writeRaw("{");
         bool c = pushComma();
         write("name", prop.name);
-
-        if (FFlag::LuauDeclarationExtraPropData)
-            write("nameLocation", prop.nameLocation);
-
+        write("nameLocation", prop.nameLocation);
         writeType("AstDeclaredClassProp");
         write("luauType", prop.ty);
-
-        if (FFlag::LuauDeclarationExtraPropData)
-            write("location", prop.location);
-
+        write("location", prop.location);
         popComma(c);
         writeRaw("}");
     }
 
-    void write(class AstStatDeclareClass* node)
+    void write(class AstStatDeclareExternType* node)
     {
         writeNode(
             node,
@@ -1002,6 +1018,8 @@ struct AstJsonEncoder : public AstVisitor
                     PROP(prefix);
                 if (node->prefixLocation)
                     write("prefixLocation", *node->prefixLocation);
+                if (FFlag::LuauTrackPrefixLocal && node->prefixLocal)
+                    write("prefixLocal", node->prefixLocal);
                 PROP(name);
                 PROP(nameLocation);
                 PROP(parameters);
@@ -1061,6 +1079,7 @@ struct AstJsonEncoder : public AstVisitor
             "AstTypeFunction",
             [&]()
             {
+                PROP(attributes);
                 PROP(generics);
                 PROP(genericPacks);
                 PROP(argTypes);
@@ -1080,6 +1099,11 @@ struct AstJsonEncoder : public AstVisitor
                 PROP(expr);
             }
         );
+    }
+
+    void write(class AstTypeOptional* node)
+    {
+        writeNode(node, "AstTypeOptional", [&]() {});
     }
 
     void write(class AstTypeUnion* node)
@@ -1155,6 +1179,31 @@ struct AstJsonEncoder : public AstVisitor
         );
     }
 
+    void write(class AstAttr* node)
+    {
+        writeNode(
+            node,
+            "AstAttr",
+            [&]()
+            {
+                write("name", node->name);
+            }
+        );
+    }
+
+    bool visit(class AstTypeGroup* node) override
+    {
+        writeNode(
+            node,
+            "AstTypeGroup",
+            [&]()
+            {
+                write("inner", node->type);
+            }
+        );
+        return false;
+    }
+
     bool visit(class AstTypeSingletonBool* node) override
     {
         writeNode(
@@ -1200,6 +1249,12 @@ struct AstJsonEncoder : public AstVisitor
     }
 
     bool visit(class AstExprConstantNumber* node) override
+    {
+        write(node);
+        return false;
+    }
+
+    bool visit(class AstExprConstantInteger* node) override
     {
         write(node);
         return false;
@@ -1403,7 +1458,7 @@ struct AstJsonEncoder : public AstVisitor
         return false;
     }
 
-    bool visit(class AstStatDeclareClass* node) override
+    bool visit(class AstStatDeclareExternType* node) override
     {
         write(node);
         return false;
@@ -1434,6 +1489,12 @@ struct AstJsonEncoder : public AstVisitor
     }
 
     bool visit(class AstTypeTypeof* node) override
+    {
+        write(node);
+        return false;
+    }
+
+    bool visit(class AstTypeOptional* node) override
     {
         write(node);
         return false;

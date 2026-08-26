@@ -12,12 +12,12 @@
 
 using namespace Luau;
 
-LUAU_FASTFLAG(DebugLuauDeferredConstraintResolution)
+LUAU_FASTFLAG(DebugLuauForceOldSolver)
 
 struct TxnLogFixture
 {
-    TxnLog log{/*useScopes*/ true};
-    TxnLog log2{/*useScopes*/ true};
+    TxnLog log;
+    TxnLog log2;
     TypeArena arena;
     BuiltinTypes builtinTypes;
 
@@ -28,47 +28,14 @@ struct TxnLogFixture
     TypeId b = freshType(NotNull{&arena}, NotNull{&builtinTypes}, globalScope.get());
     TypeId c = freshType(NotNull{&arena}, NotNull{&builtinTypes}, childScope.get());
 
-    TypeId g = arena.addType(GenericType{"G"});
+    TypeId g = arena.addType(GenericType{"G", Polarity::Mixed});
 };
 
 TEST_SUITE_BEGIN("TxnLog");
 
-TEST_CASE_FIXTURE(TxnLogFixture, "colliding_union_incoming_type_has_greater_scope")
-{
-    ScopedFastFlag sff{FFlag::DebugLuauDeferredConstraintResolution, true};
-
-    log.replace(c, BoundType{a});
-    log2.replace(a, BoundType{c});
-
-    CHECK(nullptr != log.pending(c));
-
-    log.concatAsUnion(std::move(log2), NotNull{&arena});
-
-    // 'a has greater scope than 'c, so we expect the incoming binding of 'a to
-    // be discarded.
-
-    CHECK(nullptr == log.pending(a));
-
-    const PendingType* pt = log.pending(c);
-    REQUIRE(pt != nullptr);
-
-    CHECK(!pt->dead);
-    const BoundType* bt = get_if<BoundType>(&pt->pending.ty);
-
-    CHECK(a == bt->boundTo);
-
-    log.commit();
-
-    REQUIRE(get<FreeType>(a));
-
-    const BoundType* bound = get<BoundType>(c);
-    REQUIRE(bound);
-    CHECK(a == bound->boundTo);
-}
-
 TEST_CASE_FIXTURE(TxnLogFixture, "colliding_union_incoming_type_has_lesser_scope")
 {
-    ScopedFastFlag sff{FFlag::DebugLuauDeferredConstraintResolution, true};
+    ScopedFastFlag sff{FFlag::DebugLuauForceOldSolver, false};
 
     log.replace(a, BoundType{c});
     log2.replace(c, BoundType{a});
@@ -101,7 +68,7 @@ TEST_CASE_FIXTURE(TxnLogFixture, "colliding_union_incoming_type_has_lesser_scope
 
 TEST_CASE_FIXTURE(TxnLogFixture, "colliding_coincident_logs_do_not_create_degenerate_unions")
 {
-    ScopedFastFlag sff{FFlag::DebugLuauDeferredConstraintResolution, true};
+    ScopedFastFlag sff{FFlag::DebugLuauForceOldSolver, false};
 
     log.replace(a, BoundType{b});
     log2.replace(a, BoundType{b});

@@ -14,7 +14,9 @@
 
 using namespace Luau;
 
-LUAU_FASTFLAG(DebugLuauDeferredConstraintResolution)
+LUAU_FASTFLAG(DebugLuauForceOldSolver)
+LUAU_FASTFLAG(DebugLuauForbidInternalTypes)
+LUAU_FASTFLAG(LuauBetterInferredGenericNames)
 
 TEST_SUITE_BEGIN("Generalization");
 
@@ -26,10 +28,12 @@ struct GeneralizationFixture
     ScopePtr scope = std::make_shared<Scope>(globalScope);
     ToStringOptions opts;
 
-    DenseHashSet<TypeId> generalizedTypes_{nullptr};
-    NotNull<DenseHashSet<TypeId>> generalizedTypes{&generalizedTypes_};
+    ScopedFastFlag sff_LuauBetterInferredGenericNames{FFlag::LuauBetterInferredGenericNames, true};
 
-    ScopedFastFlag sff{FFlag::DebugLuauDeferredConstraintResolution, true};
+    DenseHashSet2<TypeId> generalizedTypes_;
+    NotNull<DenseHashSet2<TypeId>> generalizedTypes{&generalizedTypes_};
+
+    ScopedFastFlag sff{FFlag::DebugLuauForceOldSolver, false};
 
     std::pair<TypeId, FreeType*> freshType()
     {
@@ -112,12 +116,13 @@ TEST_CASE_FIXTURE(GeneralizationFixture, "dont_traverse_into_class_types_when_ge
 {
     auto [propTy, _] = freshType();
 
-    TypeId cursedClass = arena.addType(ClassType{"Cursed", {{"oh_no", Property::readonly(propTy)}}, std::nullopt, std::nullopt, {}, {}, "", {}});
+    TypeId cursedExternType =
+        arena.addType(ExternType{"Cursed", {{"oh_no", Property::readonly(propTy)}}, std::nullopt, std::nullopt, {}, {}, "", {}});
 
-    auto genClass = generalize(cursedClass);
-    REQUIRE(genClass);
+    auto genExternType = generalize(cursedExternType);
+    REQUIRE(genExternType);
 
-    auto genPropTy = get<ClassType>(*genClass)->props.at("oh_no").readTy;
+    auto genPropTy = get<ExternType>(*genExternType)->props.at("oh_no").readTy;
     CHECK(is<FreeType>(*genPropTy));
 }
 
@@ -160,10 +165,12 @@ TEST_CASE_FIXTURE(GeneralizationFixture, "functions_containing_cyclic_tables_can
 {
     TypeId selfTy = arena.addType(BlockedType{});
 
-    TypeId methodTy = arena.addType(FunctionType{
-        arena.addTypePack({selfTy}),
-        arena.addTypePack({builtinTypes.numberType}),
-    });
+    TypeId methodTy = arena.addType(
+        FunctionType{
+            arena.addTypePack({selfTy}),
+            arena.addTypePack({builtinTypes.numberType}),
+        }
+    );
 
     asMutable(selfTy)->ty.emplace<TableType>(
         TableType::Props{{"count", builtinTypes.numberType}, {"method", methodTy}}, std::nullopt, TypeLevel{}, TableState::Sealed
@@ -179,9 +186,9 @@ TEST_CASE_FIXTURE(GeneralizationFixture, "functions_containing_cyclic_tables_can
 TEST_CASE_FIXTURE(GeneralizationFixture, "union_type_traversal_doesnt_crash")
 {
     // t1 where t1 = ('h <: (t1 <: 'i)) | ('j <: (t1 <: 'i))
-    TypeId i = arena.addType(FreeType{NotNull{globalScope.get()}});
-    TypeId h = arena.addType(FreeType{NotNull{globalScope.get()}});
-    TypeId j = arena.addType(FreeType{NotNull{globalScope.get()}});
+    TypeId i = arena.freshType(NotNull{&builtinTypes}, globalScope.get());
+    TypeId h = arena.freshType(NotNull{&builtinTypes}, globalScope.get());
+    TypeId j = arena.freshType(NotNull{&builtinTypes}, globalScope.get());
     TypeId unionType = arena.addType(UnionType{{h, j}});
     getMutable<FreeType>(h)->upperBound = i;
     getMutable<FreeType>(h)->lowerBound = builtinTypes.neverType;
@@ -196,9 +203,9 @@ TEST_CASE_FIXTURE(GeneralizationFixture, "union_type_traversal_doesnt_crash")
 TEST_CASE_FIXTURE(GeneralizationFixture, "intersection_type_traversal_doesnt_crash")
 {
     // t1 where t1 = ('h <: (t1 <: 'i)) & ('j <: (t1 <: 'i))
-    TypeId i = arena.addType(FreeType{NotNull{globalScope.get()}});
-    TypeId h = arena.addType(FreeType{NotNull{globalScope.get()}});
-    TypeId j = arena.addType(FreeType{NotNull{globalScope.get()}});
+    TypeId i = arena.freshType(NotNull{&builtinTypes}, globalScope.get());
+    TypeId h = arena.freshType(NotNull{&builtinTypes}, globalScope.get());
+    TypeId j = arena.freshType(NotNull{&builtinTypes}, globalScope.get());
     TypeId intersectionType = arena.addType(IntersectionType{{h, j}});
 
     getMutable<FreeType>(h)->upperBound = i;
@@ -209,6 +216,88 @@ TEST_CASE_FIXTURE(GeneralizationFixture, "intersection_type_traversal_doesnt_cra
     getMutable<FreeType>(j)->lowerBound = builtinTypes.neverType;
 
     generalize(intersectionType);
+}
+
+TEST_CASE_FIXTURE(GeneralizationFixture, "('a) -> 'a")
+{
+    TypeId freeTy = freshType().first;
+    TypeId fnTy = arena.addType(FunctionType{arena.addTypePack({freeTy}), arena.addTypePack({freeTy})});
+
+    generalize(fnTy);
+
+    CHECK("<T>(T) -> T" == toString(fnTy));
+}
+
+TEST_CASE_FIXTURE(GeneralizationFixture, "(t1, (t1 <: 'b)) -> () where t1 = ('a <: (t1 <: 'b) & {number} & {number})")
+{
+    TableType tt;
+    tt.indexer = TableIndexer{builtinTypes.numberType, builtinTypes.numberType};
+    TypeId numberArray = arena.addType(TableType{tt});
+
+    auto [aTy, aFree] = freshType();
+    auto [bTy, bFree] = freshType();
+
+    aFree->upperBound = arena.addType(IntersectionType{{bTy, numberArray, numberArray}});
+    bFree->lowerBound = aTy;
+
+    TypeId functionTy = arena.addType(FunctionType{arena.addTypePack({aTy, bTy}), builtinTypes.emptyTypePack});
+
+    generalize(functionTy);
+
+    CHECK("(unknown & {number}, unknown) -> ()" == toString(functionTy));
+}
+
+TEST_CASE_FIXTURE(GeneralizationFixture, "(('a <: number | string)) -> string?")
+{
+    auto [aTy, aFree] = freshType();
+
+    aFree->upperBound = arena.addType(UnionType{{builtinTypes.numberType, builtinTypes.stringType}});
+
+    TypeId fnType = arena.addType(FunctionType{arena.addTypePack({aTy}), arena.addTypePack({builtinTypes.optionalStringType})});
+
+    generalize(fnType);
+
+    CHECK("(number | string) -> string?" == toString(fnType));
+}
+
+TEST_CASE_FIXTURE(GeneralizationFixture, "(('a <: {'b})) -> ()")
+{
+    auto [aTy, aFree] = freshType();
+    auto [bTy, bFree] = freshType();
+
+    TableType tt;
+    tt.indexer = TableIndexer{builtinTypes.numberType, bTy};
+
+    aFree->upperBound = arena.addType(tt);
+
+    TypeId functionTy = arena.addType(FunctionType{arena.addTypePack({aTy}), builtinTypes.emptyTypePack});
+
+    generalize(functionTy);
+
+    // The free type 'b is not replace with unknown because it appears in an
+    // invariant context.
+    CHECK("<T>({T}) -> ()" == toString(functionTy));
+}
+
+TEST_CASE_FIXTURE(GeneralizationFixture, "(('b <: {t1}), ('a <: t1)) -> t1 where t1 = (('a <: t1) <: 'c)")
+{
+    auto [aTy, aFree] = freshType();
+    auto [bTy, bFree] = freshType();
+    auto [cTy, cFree] = freshType();
+
+    aFree->upperBound = cTy;
+    cFree->lowerBound = aTy;
+
+    TableType tt;
+    tt.indexer = TableIndexer{builtinTypes.numberType, cTy};
+
+    bFree->upperBound = arena.addType(tt);
+
+    TypeId functionTy = arena.addType(FunctionType{arena.addTypePack({bTy, aTy}), arena.addTypePack({cTy})});
+
+    generalize(functionTy);
+
+    CHECK("<T>({T}, T) -> T" == toString(functionTy));
 }
 
 TEST_CASE_FIXTURE(BuiltinsFixture, "generalization_traversal_should_re_traverse_unions_if_they_change_type")
@@ -230,7 +319,7 @@ function foo()
    button.LayoutOrder = func(product) * dir
   end
  end
- 
+
   function(mode)
    if mode == 'Name'then
    else
@@ -248,6 +337,216 @@ function foo()
   end
 end
 )");
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "generalization_should_not_leak_free_type")
+{
+    ScopedFastFlag _{FFlag::DebugLuauForbidInternalTypes, true};
+
+    // This test case should just not assert
+    CheckResult result = check(R"(
+        function foo()
+
+            local productButtonPairs = {}
+            local func
+            local dir = -1
+
+            local function updateSearch()
+                for product, button in pairs(productButtonPairs) do
+                    -- This line may have a floating free type pack.
+                    button.LayoutOrder = func(product) * dir
+                end
+            end
+
+            function(mode)
+                if mode == 'New'then
+                    func = function(p)
+                        return p.id
+                    end
+                elseif mode == 'Price'then
+                    func = function(p)
+                        return p.price
+                    end
+                end
+            end
+        end
+    )");
+}
+
+TEST_CASE_FIXTURE(Fixture, "generics_dont_leak_into_callback")
+{
+    ScopedFastFlag _{FFlag::DebugLuauForceOldSolver, false};
+
+    LUAU_REQUIRE_NO_ERRORS(check(R"(
+        local func: <T>(T, (T) -> ()) -> () = nil :: any
+        func({}, function(obj)
+            local _ = obj
+        end)
+    )"));
+
+    // `unknown` is correct here
+    // - The lambda given can be generalized to `(unknown) -> ()`
+    // - We can substitute the `T` in `func` for either `{}` or `unknown` and
+    //   still have a well typed program.
+    // We *probably* can do a better job bidirectionally inferring the types.
+    CHECK_EQ("unknown", toString(requireTypeAtPosition(Position{3, 23})));
+}
+
+TEST_CASE_FIXTURE(Fixture, "generics_dont_leak_into_callback_2")
+{
+    ScopedFastFlag _{FFlag::DebugLuauForceOldSolver, false};
+
+    CheckResult result = check(R"(
+local func: <T>(T, (T) -> ()) -> () = nil :: any
+local foobar: (number) -> () = nil :: any
+func({}, function(obj)
+    foobar(obj)
+end)
+    )");
+
+    LUAU_REQUIRE_ERROR_COUNT(1, result);
+    auto err = get<TypeMismatch>(result.errors[0]);
+    REQUIRE(err);
+    CHECK_EQ("number", toString(err->wantedType));
+    CHECK_EQ("{  }", toString(err->givenType));
+}
+
+TEST_CASE_FIXTURE(Fixture, "generic_argument_with_singleton_oss_1808")
+{
+    // All we care about here is that this has no errors, and we correctly
+    // infer that the `false` literal should be typed as `false`.
+    LUAU_REQUIRE_NO_ERRORS(check(R"(
+        local function test<T>(value: false | (T) -> T)
+            return value
+        end
+        test(false)
+    )"));
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "avoid_cross_module_mutation_in_bidirectional_inference")
+{
+    fileResolver.source["Module/ListFns"] = R"(
+        local mod = {}
+        function mod.findWhere(list, predicate): number?
+            for i = 1, #list do
+                if predicate(list[i], i) then
+                    return i
+                end
+            end
+            return nil
+        end
+        return mod
+    )";
+
+    fileResolver.source["Module/B"] = R"(
+        local funs = require(script.Parent.ListFns)
+        local accessories = funs.findWhere(getList(), function(accessory)
+            return accessory.AccessoryType ~= accessoryTypeEnum
+        end)
+        return {}
+    )";
+
+    CheckResult result = getFrontend().check("Module/ListFns");
+    auto modListFns = getFrontend().moduleResolver.getModule("Module/ListFns");
+    freeze(modListFns->interfaceTypes);
+    freeze(*modListFns->internalTypes);
+    LUAU_REQUIRE_NO_ERRORS(result);
+    CheckResult result2 = getFrontend().check("Module/B");
+    LUAU_REQUIRE_NO_ERRORS(result);
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "generalization_fuzzer_crash")
+{
+    LUAU_REQUIRE_ERRORS(check(R"(
+        type function t0<A>(l0,...):""
+        type t0 = any
+        do
+        _()
+        _ = {_=...,}
+        _ = {_=rawget({_=_,l0,},_,- _),}
+        end
+        end
+    )"));
+}
+
+
+TEST_CASE_FIXTURE(GeneralizationFixture, "collapse_two_type_direct_cycle")
+{
+    auto [t1, ft1] = freshType();
+    auto [t2, ft2] = freshType();
+
+    // t1.upper = t2, t2.lower = t1 -- direct 2-cycle
+    ft1->upperBound = t2;
+    ft2->lowerBound = t1;
+
+    TypeId functionTy = arena.addType(FunctionType{arena.addTypePack({t1}), arena.addTypePack({t2})});
+
+    generalize(functionTy);
+
+    // Both should resolve to the same generic
+    CHECK(follow(t1) == follow(t2));
+}
+
+TEST_CASE_FIXTURE(GeneralizationFixture, "collapse_cycle_with_external_bound")
+{
+    auto [t1, ft1] = freshType();
+    auto [t2, ft2] = freshType();
+
+    // t1.upper = t2, t2.lower = t1, t1.lower = number
+    // After cycle collapse, the representative should generalize to number.
+    ft1->upperBound = t2;
+    ft1->lowerBound = builtinTypes.numberType;
+    ft2->lowerBound = t1;
+
+    TypeId functionTy = arena.addType(FunctionType{builtinTypes.emptyTypePack, arena.addTypePack({t1})});
+
+    generalize(functionTy);
+
+    CHECK("number" == toString(follow(t1)));
+    CHECK("number" == toString(follow(t2)));
+}
+
+TEST_CASE_FIXTURE(GeneralizationFixture, "collapse_cycle_with_external_bound_in_union")
+{
+    auto [t1, ft1] = freshType();
+    auto [t2, ft2] = freshType();
+
+    // t1.upper = t2, t2.lower = t1, t1.lower = number | t2
+    // This is the pattern from the table.insert/table.unpack interaction.
+    ft1->upperBound = t2;
+    ft1->lowerBound = arena.addType(UnionType{{builtinTypes.numberType, t2}});
+    ft2->lowerBound = t1;
+    ft2->upperBound = t1;
+
+    TypeId functionTy = arena.addType(FunctionType{builtinTypes.emptyTypePack, arena.addTypePack({t1})});
+
+    generalize(functionTy);
+
+    CHECK("number" == toString(follow(t1)));
+    CHECK("number" == toString(follow(t2)));
+}
+
+TEST_CASE_FIXTURE(GeneralizationFixture, "no_spurious_cycle_through_intersection")
+{
+    TableType tt;
+    tt.indexer = TableIndexer{builtinTypes.numberType, builtinTypes.numberType};
+    TypeId numberArray = arena.addType(TableType{tt});
+
+    auto [t1, ft1] = freshType();
+    auto [t2, ft2] = freshType();
+
+    // t1.upper = t2 & {number} (intersection containing t2 -- NOT a direct bound)
+    // t2.lower = t1 (direct)
+    // These should NOT form a cycle because t1's bound is an intersection, not t2 directly.
+    ft1->upperBound = arena.addType(IntersectionType{{t2, numberArray}});
+    ft2->lowerBound = t1;
+
+    TypeId functionTy = arena.addType(FunctionType{arena.addTypePack({t1, t2}), builtinTypes.emptyTypePack});
+
+    generalize(functionTy);
+
+    // t1 and t2 should remain distinct (not collapsed into one)
+    CHECK(toString(follow(t1)) != toString(follow(t2)));
 }
 
 TEST_SUITE_END();

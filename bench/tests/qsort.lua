@@ -1,4 +1,4 @@
-local function prequire(name) local success, result = pcall(require, name); return if success then result else nil end
+local function prequire(name) local success, result = pcall(require, name); return success and result end
 local bench = script and require(script.Parent.bench_support) or prequire("bench_support") or require("../bench_support")
 
 function test()
@@ -54,15 +54,21 @@ function test()
   --end
 
   function testsorts(x)
-  local n=1
-  while x[n] do n=n+1 end; n=n-1		-- count elements
-  --show("original",x)
-  qsort(x,1,n,function (x,y) return x<y end)
-  --show("after quicksort",x)
-  selectionsort(x,n,function (x,y) return x>y end)
-  --show("after reverse selection sort",x)
-  qsort(x,1,n,function (x,y) return x<y end)
-  --show("after quicksort again",x)
+	  local clone = table.clone(x)
+	  table.sort(clone)
+
+	  local n=1
+	  while x[n] do n=n+1 end; n=n-1		-- count elements
+	  --show("original",x)
+	  qsort(x,1,n,function (x,y) return x<y end)
+	  for i=1, n do assert(x[i] == clone[i]) end
+	  --show("after quicksort",x)
+	  selectionsort(x,n,function (x,y) return x>y end)
+	  for i=1, n do assert(x[i] == clone[n + 1 - i]) end
+	  --show("after reverse selection sort",x)
+	  qsort(x,1,n,function (x,y) return x<y end)
+	  for i=1, n do assert(x[i] == clone[i]) end
+	  --show("after quicksort again",x)
   end
 
   -- array to be sorted

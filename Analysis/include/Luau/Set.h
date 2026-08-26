@@ -2,9 +2,7 @@
 #pragma once
 
 #include "Luau/Common.h"
-#include "Luau/DenseHash.h"
-
-LUAU_FASTFLAG(DebugLuauDeferredConstraintResolution)
+#include "Luau/DenseHash2.h"
 
 namespace Luau
 {
@@ -12,13 +10,13 @@ namespace Luau
 template<typename T>
 using SetHashDefault = std::conditional_t<std::is_pointer_v<T>, DenseHashPointer, std::hash<T>>;
 
-// This is an implementation of `unordered_set` using `DenseHashMap<T, bool>` to support erasure.
+// This is an implementation of `unordered_set` using `DenseHashMap2<T, bool>` to support erasure.
 // This lets us work around `DenseHashSet` limitations and get a more traditional set interface.
 template<typename T, typename Hash = SetHashDefault<T>>
 class Set
 {
 private:
-    using Impl = DenseHashMap<T, bool, Hash>;
+    using Impl = DenseHashMap2<T, bool, Hash>;
     Impl mapping;
     size_t entryCount = 0;
 
@@ -26,10 +24,7 @@ public:
     class const_iterator;
     using iterator = const_iterator;
 
-    Set(const T& empty_key)
-        : mapping{empty_key}
-    {
-    }
+    Set() = default;
 
     bool insert(const T& element)
     {

@@ -1,4 +1,4 @@
-local function prequire(name) local success, result = pcall(require, name); return if success then result else nil end
+local function prequire(name) local success, result = pcall(require, name); return success and result end
 local bench = script and require(script.Parent.bench_support) or prequire("bench_support") or require("../../bench_support")
 
 function test()
@@ -125,6 +125,8 @@ function test()
     offsetMomentum(bodies, nbody)
     for i = 1, N do advance(bodies, nbody, 0.01) end
     local ts1 = os.clock()
+
+    assert(math.abs(energy(bodies, nbody) + 0.169089263) < 1e-6)
 
     return ts1 - ts0
 end

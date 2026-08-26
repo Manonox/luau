@@ -25,7 +25,7 @@ SOFTWARE.
 -- http://benchmarksgame.alioth.debian.org/
 -- contributed by Mike Pall
 
-local function prequire(name) local success, result = pcall(require, name); return if success then result else nil end
+local function prequire(name) local success, result = pcall(require, name); return success and result end
 local bench = script and require(script.Parent.bench_support) or prequire("bench_support") or require("../../bench_support")
 
 function test()
@@ -68,7 +68,10 @@ for i=1,N do
   vBv = vBv + ui*vi
   vv = vv + vi*vi
 end
-print(string.format("%0.9f\n", math.sqrt(vBv / vv)))
+local result = math.sqrt(vBv / vv)
+print(string.format("%0.9f\n", result))
+
+assert(N ~= 100 or math.abs(result - 1.274219991) < 1e-6)
 
 end
 

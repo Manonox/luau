@@ -2,7 +2,7 @@
 #pragma once
 
 #include "Luau/TypeFwd.h"
-#include "Luau/DenseHash.h"
+#include "Luau/DenseHash2.h"
 #include "Luau/Unifiable.h"
 
 #include <vector>
@@ -16,13 +16,13 @@ struct Scope;
 
 void quantify(TypeId ty, TypeLevel level);
 
-// TODO: This is eerily similar to the pattern that NormalizedClassType
+// TODO: This is eerily similar to the pattern that NormalizedExternType
 // implements. We could, and perhaps should, merge them together.
 template<typename K, typename V>
 struct OrderedMap
 {
     std::vector<K> keys;
-    DenseHashMap<K, V> pairings{nullptr};
+    DenseHashMap2<K, V> pairings;
 
     void push(K k, V v)
     {
@@ -30,14 +30,5 @@ struct OrderedMap
         pairings[k] = v;
     }
 };
-
-struct QuantifierResult
-{
-    TypeId result;
-    OrderedMap<TypeId, TypeId> insertedGenerics;
-    OrderedMap<TypePackId, TypePackId> insertedGenericPacks;
-};
-
-std::optional<QuantifierResult> quantify(TypeArena* arena, TypeId ty, Scope* scope);
 
 } // namespace Luau

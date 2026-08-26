@@ -21,7 +21,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ]]
-local function prequire(name) local success, result = pcall(require, name); return if success then result else nil end
+local function prequire(name) local success, result = pcall(require, name); return success and result end
 local bench = script and require(script.Parent.bench_support) or prequire("bench_support") or require("../../bench_support")
 
 function test()
@@ -92,6 +92,8 @@ for i=1,N do
  -- if i % 10 == 0 then print(collectgarbage("count")) end
 end
 print(S)
+
+assert(N ~= 64 or S == 109250)
 
 end
 

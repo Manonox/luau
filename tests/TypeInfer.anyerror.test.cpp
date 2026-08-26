@@ -13,7 +13,8 @@
 
 using namespace Luau;
 
-LUAU_FASTFLAG(DebugLuauDeferredConstraintResolution);
+LUAU_FASTFLAG(DebugLuauForceOldSolver)
+LUAU_FASTFLAG(LuauIndexingIntoErrorGivesError)
 
 TEST_SUITE_BEGIN("TypeInferAnyError");
 
@@ -32,10 +33,10 @@ TEST_CASE_FIXTURE(Fixture, "for_in_loop_iterator_returns_any")
 
     LUAU_REQUIRE_NO_ERRORS(result);
 
-    if (FFlag::DebugLuauDeferredConstraintResolution)
-        CHECK("any?" == toString(requireType("a")));
+    if (!FFlag::DebugLuauForceOldSolver)
+        CHECK("(*error-type* | ~nil)?" == toString(requireType("a")));
     else
-        CHECK(builtinTypes->anyType == requireType("a"));
+        CHECK(getBuiltins()->anyType == requireType("a"));
 }
 
 TEST_CASE_FIXTURE(Fixture, "for_in_loop_iterator_returns_any2")
@@ -53,8 +54,8 @@ TEST_CASE_FIXTURE(Fixture, "for_in_loop_iterator_returns_any2")
 
     LUAU_REQUIRE_NO_ERRORS(result);
 
-    if (FFlag::DebugLuauDeferredConstraintResolution)
-        CHECK("any?" == toString(requireType("a")));
+    if (!FFlag::DebugLuauForceOldSolver)
+        CHECK("(*error-type* | ~nil)?" == toString(requireType("a")));
     else
         CHECK("any" == toString(requireType("a")));
 }
@@ -72,8 +73,8 @@ TEST_CASE_FIXTURE(Fixture, "for_in_loop_iterator_is_any")
 
     LUAU_REQUIRE_NO_ERRORS(result);
 
-    if (FFlag::DebugLuauDeferredConstraintResolution)
-        CHECK("any?" == toString(requireType("a")));
+    if (!FFlag::DebugLuauForceOldSolver)
+        CHECK("(*error-type* | ~nil)?" == toString(requireType("a")));
     else
         CHECK("any" == toString(requireType("a")));
 }
@@ -89,8 +90,8 @@ TEST_CASE_FIXTURE(Fixture, "for_in_loop_iterator_is_any2")
         end
     )");
 
-    if (FFlag::DebugLuauDeferredConstraintResolution)
-        CHECK("any?" == toString(requireType("a")));
+    if (!FFlag::DebugLuauForceOldSolver)
+        CHECK("(*error-type* | ~nil)?" == toString(requireType("a")));
     else
         CHECK("any" == toString(requireType("a")));
 }
@@ -108,8 +109,8 @@ TEST_CASE_FIXTURE(Fixture, "for_in_loop_iterator_is_any_pack")
 
     LUAU_REQUIRE_NO_ERRORS(result);
 
-    if (FFlag::DebugLuauDeferredConstraintResolution)
-        CHECK("any?" == toString(requireType("a")));
+    if (!FFlag::DebugLuauForceOldSolver)
+        CHECK("(*error-type* | ~nil)?" == toString(requireType("a")));
     else
         CHECK("any" == toString(requireType("a")));
 }
@@ -126,7 +127,7 @@ TEST_CASE_FIXTURE(Fixture, "for_in_loop_iterator_is_error")
     LUAU_REQUIRE_ERROR_COUNT(1, result);
 
 
-    if (FFlag::DebugLuauDeferredConstraintResolution)
+    if (!FFlag::DebugLuauForceOldSolver)
     {
         // Bug: We do not simplify at the right time
         CHECK_EQ("*error-type*?", toString(requireType("a")));
@@ -148,7 +149,7 @@ TEST_CASE_FIXTURE(Fixture, "for_in_loop_iterator_is_error2")
         end
     )");
 
-    if (FFlag::DebugLuauDeferredConstraintResolution)
+    if (!FFlag::DebugLuauForceOldSolver)
     {
         // CLI-97375(awe): `bar()` is returning `nil` here, which isn't wrong necessarily,
         // but then we're signaling an additional error for the access on `nil`.
@@ -160,7 +161,6 @@ TEST_CASE_FIXTURE(Fixture, "for_in_loop_iterator_is_error2")
     else
     {
         LUAU_REQUIRE_ERROR_COUNT(1, result);
-
         CHECK_EQ("*error-type*", toString(requireType("a")));
     }
 }
@@ -247,7 +247,8 @@ TEST_CASE_FIXTURE(Fixture, "assign_prop_to_table_by_calling_any_yields_any")
     REQUIRE(ttv);
     REQUIRE(ttv->props.count("prop"));
 
-    REQUIRE_EQ("any", toString(ttv->props["prop"].type()));
+    REQUIRE(ttv->props["prop"].readTy);
+    CHECK_EQ("any", toString(*ttv->props["prop"].readTy));
 }
 
 TEST_CASE_FIXTURE(Fixture, "quantify_any_does_not_bind_to_itself")
@@ -261,11 +262,13 @@ TEST_CASE_FIXTURE(Fixture, "quantify_any_does_not_bind_to_itself")
     LUAU_REQUIRE_NO_ERRORS(result);
 
     TypeId aType = requireType("A");
-    CHECK_EQ(aType, builtinTypes->anyType);
+    CHECK_EQ(aType, getBuiltins()->anyType);
 }
 
 TEST_CASE_FIXTURE(Fixture, "calling_error_type_yields_error")
 {
+    ScopedFastFlag _{FFlag::LuauIndexingIntoErrorGivesError, true};
+
     CheckResult result = check(R"(
         local a = unknown.Parent.Reward.GetChildren()
     )");
@@ -276,23 +279,18 @@ TEST_CASE_FIXTURE(Fixture, "calling_error_type_yields_error")
     REQUIRE(err != nullptr);
 
     CHECK_EQ("unknown", err->name);
-
-    if (FFlag::DebugLuauDeferredConstraintResolution)
-        CHECK_EQ("any", toString(requireType("a")));
-    else
-        CHECK_EQ("*error-type*", toString(requireType("a")));
+    CHECK_EQ("*error-type*", toString(requireType("a")));
 }
 
 TEST_CASE_FIXTURE(Fixture, "chain_calling_error_type_yields_error")
 {
+    ScopedFastFlag _{FFlag::LuauIndexingIntoErrorGivesError, true};
+
     CheckResult result = check(R"(
         local a = Utility.Create "Foo" {}
     )");
 
-    if (FFlag::DebugLuauDeferredConstraintResolution)
-        CHECK_EQ("any", toString(requireType("a")));
-    else
-        CHECK_EQ("*error-type*", toString(requireType("a")));
+    CHECK_EQ("*error-type*", toString(requireType("a")));
 }
 
 TEST_CASE_FIXTURE(BuiltinsFixture, "replace_every_free_type_when_unifying_a_complex_function_with_any")
@@ -306,11 +304,7 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "replace_every_free_type_when_unifying_a_comp
     )");
 
     LUAU_REQUIRE_NO_ERRORS(result);
-
-    if (FFlag::DebugLuauDeferredConstraintResolution)
-        CHECK_EQ("any?", toString(requireType("b")));
-    else
-        CHECK_EQ("any", toString(requireType("b")));
+    CHECK_EQ("any", toString(requireType("b")));
 }
 
 TEST_CASE_FIXTURE(Fixture, "call_to_any_yields_any")
@@ -378,7 +372,7 @@ local bar = foo.nutrition + 100
     LUAU_REQUIRE_ERROR_COUNT(1, result);
 
     // We should definitely get this error
-    CHECK_EQ("Unknown global 'makesandwich'", toString(result.errors[0]));
+    CHECK_EQ("Unknown global 'makesandwich'; consider assigning to it first", toString(result.errors[0]));
     // We get this error if makesandwich() returns a free type
     // CHECK_EQ("Unknown type used in + operation; consider adding a type annotation to 'foo'", toString(result.errors[1]));
 }
@@ -421,6 +415,8 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "table_of_any_calls")
 
 TEST_CASE_FIXTURE(Fixture, "intersection_of_any_can_have_props")
 {
+    ScopedFastFlag _{FFlag::LuauIndexingIntoErrorGivesError, true};
+
     // *blocked-130* ~ hasProp any & ~(false?), "_status"
     CheckResult result = check(R"(
 function foo(x: any, y)
@@ -431,7 +427,18 @@ function foo(x: any, y)
 end
 )");
 
-    CHECK("(any, any) -> any" == toString(requireType("foo")));
+    if (!FFlag::DebugLuauForceOldSolver)
+    {
+        // This is an artifact of formalizing `any = unknown | *error-type*`.
+        // We refine `any` to `*error-type* | ~(false?)`, and then index
+        // into it, versus the old solver path where we just claim refining
+        // `any` means `any`.
+        CHECK("(any, *error-type*) -> *error-type*" == toString(requireType("foo")));
+    }
+    else
+    {
+        CHECK("(any, any) -> any" == toString(requireType("foo")));
+    }
 }
 
 TEST_CASE_FIXTURE(Fixture, "cast_to_table_of_any")

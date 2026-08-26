@@ -25,7 +25,7 @@ SOFTWARE.
 -- http://benchmarksgame.alioth.debian.org/
 -- contributed by Mike Pall
 
-local function prequire(name) local success, result = pcall(require, name); return if success then result else nil end
+local function prequire(name) local success, result = pcall(require, name); return success and result end
 local bench = script and require(script.Parent.bench_support) or prequire("bench_support") or require("../../bench_support")
 
 function test()
@@ -73,6 +73,8 @@ end
 local n = tonumber(arg and arg[1]) or 8
 local sum, flips = fannkuch(n)
 print(sum, "\nPfannkuchen(", n, ") = ", flips, "\n")
+
+assert(n ~= 8 or (sum == 1616 and flips == 22))
 
 end
 

@@ -4,7 +4,9 @@
 #include "Luau/Error.h"
 #include "Luau/Location.h"
 #include "Luau/Type.h"
+#include "Luau/TypeIds.h"
 #include "Luau/TypePack.h"
+#include "Luau/VisitType.h"
 
 #include <memory>
 #include <optional>
@@ -40,11 +42,11 @@ struct InConditionalContext
     TypeContext* typeContext;
     TypeContext oldValue;
 
-    InConditionalContext(TypeContext* c)
+    explicit InConditionalContext(TypeContext* c, TypeContext newValue = TypeContext::Condition)
         : typeContext(c)
         , oldValue(*c)
     {
-        *typeContext = TypeContext::Condition;
+        *typeContext = newValue;
     }
 
     ~InConditionalContext()
@@ -54,14 +56,6 @@ struct InConditionalContext
 };
 
 using ScopePtr = std::shared_ptr<struct Scope>;
-
-std::optional<Property> findTableProperty(
-    NotNull<BuiltinTypes> builtinTypes,
-    ErrorVec& errors,
-    TypeId ty,
-    const std::string& name,
-    Location location
-);
 
 std::optional<TypeId> findMetatableEntry(
     NotNull<BuiltinTypes> builtinTypes,
@@ -75,7 +69,8 @@ std::optional<TypeId> findTablePropertyRespectingMeta(
     ErrorVec& errors,
     TypeId ty,
     const std::string& name,
-    Location location
+    Location location,
+    bool useNewSolver
 );
 std::optional<TypeId> findTablePropertyRespectingMeta(
     NotNull<BuiltinTypes> builtinTypes,
@@ -83,23 +78,28 @@ std::optional<TypeId> findTablePropertyRespectingMeta(
     TypeId ty,
     const std::string& name,
     ValueContext context,
-    Location location
+    Location location,
+    bool useNewSolver
 );
 
 bool occursCheck(TypeId needle, TypeId haystack);
+
+// NOTE: This uses a custom enum as it is replacing several bespoke
+// implementations of the same logic.
+enum class OccursCheckResult
+{
+    Pass,
+    Fail
+};
+
+OccursCheckResult occursCheck(TypePackId needle, TypePackId haystack);
 
 // Returns the minimum and maximum number of types the argument list can accept.
 std::pair<size_t, std::optional<size_t>> getParameterExtents(const TxnLog* log, TypePackId tp, bool includeHiddenVariadics = false);
 
 // Extend the provided pack to at least `length` types.
 // Returns a temporary TypePack that contains those types plus a tail.
-TypePack extendTypePack(
-    TypeArena& arena,
-    NotNull<BuiltinTypes> builtinTypes,
-    TypePackId pack,
-    size_t length,
-    std::vector<std::optional<TypeId>> overrides = {}
-);
+TypePack extendTypePack(TypeArena& arena, NotNull<BuiltinTypes> builtinTypes, TypePackId pack, size_t length);
 
 /**
  * Reduces a union by decomposing to the any/error type if it appears in the
@@ -247,5 +247,178 @@ std::optional<Ty> follow(std::optional<Ty> ty)
     else
         return std::nullopt;
 }
+
+/**
+ * Returns whether or not expr is a literal expression, for example:
+ * - Scalar literals (numbers, booleans, strings, nil)
+ * - Table literals
+ * - Lambdas (a "function literal")
+ */
+bool isLiteral(const AstExpr* expr);
+
+// Clip with LuauRelaxConstraintOrderingForFunctionCheck
+/**
+ * Given a function call and a mapping from expression to type, determine
+ * whether the type of any argument in said call in depends on a blocked types.
+ * This is used as a precondition for bidirectional inference: be warned that
+ * the behavior of this algorithm is tightly coupled to that of bidirectional
+ * inference.
+ * @param expr Expression to search
+ * @param astTypes Mapping from AST node to TypeID
+ * @returns A vector of blocked types
+ */
+
+std::vector<TypeId> findBlockedArgTypesIn_DEPRECATED(AstExprCall* expr, NotNull<DenseHashMap2<const AstExpr*, TypeId>> astTypes);
+
+/**
+ * Given a scope and a free type, find the closest parent that has a present
+ * `interiorFreeTypes` and append the given type to said list. This list will
+ * be generalized when the requisite `GeneralizationConstraint` is resolved.
+ * @param scope Initial scope this free type was attached to
+ * @param ty Free type to track.
+ */
+void trackInteriorFreeType(Scope* scope, TypeId ty);
+
+void trackInteriorFreeTypePack(Scope* scope, TypePackId tp);
+
+// A fast approximation of subTy <: superTy
+bool fastIsSubtype(TypeId subTy, TypeId superTy);
+
+/**
+ * @param tables A list of potential table parts of a union
+ * @param exprType Type of the expression to match
+ * @return An element of `tables` that best matches `exprType`.
+ */
+std::optional<TypeId> extractMatchingTableType_DEPRECATED(const UnionType* expectedUnion, TypeId exprType, NotNull<BuiltinTypes> builtinTypes);
+
+std::optional<TypeId> extractMatchingTableType(
+    const UnionType* expectedUnion,
+    TypeId exprType,
+    NotNull<BuiltinTypes> builtinTypes,
+    NotNull<TypeArena> arena
+);
+
+/**
+ * @param item A member of a table in an AST
+ * @return Whether the item is a key-value pair with a statically defined string key.
+ *
+ * ```
+ * {
+ *      ["foo"] = ..., -- is a record
+ *      bar = ..., -- is a record
+ *      ..., -- not a record: non-string key (number)
+ *      [true] = ..., -- not a record: non-string key (boolean)
+ *      [ foobar() ] = ..., -- not a record: unknown key value.
+ *      ["foo" .. "bar"] = ..., -- not a record (don't make us handle it).
+ * }
+ * ```
+ */
+bool isRecord(const AstExprTable::Item& item);
+
+/**
+ * Do a quick check for whether the type `ty` is exactly `false | nil`. This
+ * will *not* do any sort of semantic analysis, for example the type:
+ *
+ *      (boolean?) & (false | nil)
+ *
+ * ... will not be considered falsy, despite it being semantically equivalent
+ * to `false | nil`.
+ *
+ * @return Whether the input is approximately `false | nil`.
+ */
+bool isApproximatelyFalsyType(TypeId ty);
+
+/**
+ * Do a quick check for whether the type `ty` is exactly `~(false | nil)`.
+ * This will *not* do any sort of semantic analysis, for example the type:
+ *
+ *      unknown & ~(false | nil)
+ *
+ * ... will not be considered falsy, despite it being semantically equivalent
+ * to `~(false | nil)`.
+ *
+ * @return Whether the input is approximately `~(false | nil)`.
+ */
+bool isApproximatelyTruthyType(TypeId ty);
+
+// Unwraps any grouping expressions iteratively.
+AstExpr* unwrapGroup(AstExpr* expr);
+
+// Returns true if ty is optional, ie if it is a supertype of nil
+bool isOptionalType(TypeId ty, NotNull<BuiltinTypes> builtinTypes);
+
+// These are magic types used in `TypeChecker2` and `NonStrictTypeChecker`
+//
+// `_luau_print` causes it's argument to be printed out, as in:
+//
+//      local x: _luau_print<number>
+//
+// ... will cause `number` to be printed.
+inline constexpr char kLuauPrint[] = "_luau_print";
+// `_luau_force_constraint_solving_incomplete` will cause us to _always_ emit
+// a constraint solving incomplete error to test semantics around that specific
+// error.
+inline constexpr char kLuauForceConstraintSolvingIncomplete[] = "_luau_force_constraint_solving_incomplete";
+// `_luau_blocked_type` will cause us to always mint a blocked type that does
+// not get emplaced by constraint solving.
+inline constexpr char kLuauBlockedType[] = "_luau_blocked_type";
+
+struct UnionBuilder
+{
+    UnionBuilder(NotNull<TypeArena> arena, NotNull<BuiltinTypes> builtinTypes);
+    void add(TypeId ty);
+    TypeId build();
+    size_t size() const;
+    void reserve(size_t size);
+
+private:
+    NotNull<TypeArena> arena;
+    NotNull<BuiltinTypes> builtinTypes;
+    TypeIds options;
+    bool isTop = false;
+};
+
+struct IntersectionBuilder
+{
+    IntersectionBuilder(NotNull<TypeArena> arena, NotNull<BuiltinTypes> builtinTypes);
+    void add(TypeId ty);
+    TypeId build();
+    size_t size() const;
+    void reserve(size_t size);
+
+private:
+    NotNull<TypeArena> arena;
+    NotNull<BuiltinTypes> builtinTypes;
+    TypeIds parts;
+    bool isBottom = false;
+};
+
+TypeId addIntersection(NotNull<TypeArena> arena, NotNull<BuiltinTypes> builtinTypes, std::initializer_list<TypeId> list);
+TypeId addUnion(NotNull<TypeArena> arena, NotNull<BuiltinTypes> builtinTypes, std::initializer_list<TypeId> list);
+
+/**
+ * @returns if `ty` contains a generic in the set `generics`.
+ */
+bool containsGeneric(TypeId ty, NotNull<DenseHashSet2<const void*>> generics);
+bool containsGeneric(TypePackId ty, NotNull<DenseHashSet2<const void*>> generics);
+
+/**
+ * @return Whether `ty` is a type that cannot be unified with another type,
+ *         such as a blocked type, pending expansion type, or an unsolved
+ *         type function.
+ */
+bool isBlocked(TypeId ty);
+
+
+/**
+ * **YOU SHOULD PROBABLY NOT USE THIS FUNCTION.**
+ *
+ * This function is a stop-gap while we rework function call inference and
+ * eager generalization.
+ *
+ * @return An approximate return type of `ty`, assuming `ty` is a function or
+ *         union of functions.
+ */
+std::optional<TypePackId> getApproximateReturnTypeForFunctionCall(TypeId ty);
 
 } // namespace Luau

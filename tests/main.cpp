@@ -1,6 +1,8 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/Common.h"
 
+#include "Luau/CodeGenCommon.h"
+
 #define DOCTEST_CONFIG_IMPLEMENT
 // Our calls to parseOption/parseFlag don't provide a prefix so set the prefix to the empty string.
 #define DOCTEST_CONFIG_OPTIONS_PREFIX ""
@@ -27,7 +29,10 @@
 #include <sys/sysctl.h>
 #endif
 
+#include <fstream>
+#include <iostream>
 #include <optional>
+
 #include <stdio.h>
 
 // Indicates if verbose output is enabled; can be overridden via --verbose
@@ -43,15 +48,15 @@ bool codegen = false;
 // Something to seed a pseudorandom number generator with
 std::optional<unsigned> randomSeed;
 
+// Run conformance tests with JIT bytecode inliner
+bool jitInliner = false;
+
 static bool skipFastFlag(const char* flagName)
 {
     if (strncmp(flagName, "Test", 4) == 0)
         return true;
 
     if (strncmp(flagName, "Debug", 5) == 0)
-        return true;
-
-    if (strcmp(flagName, "StudioReportLuauAny") == 0)
         return true;
 
     return false;
@@ -133,6 +138,7 @@ struct BoostLikeReporter : doctest::IReporter
 
         printf("Entering test suite \"%s\"\n", tc.m_test_suite);
         printf("Entering test case \"%s\"\n", tc.m_name);
+        fflush(stdout);
     }
 
     // called when a test case has ended
@@ -144,6 +150,7 @@ struct BoostLikeReporter : doctest::IReporter
         printf("Leaving test suite \"%s\"\n", currentTest->m_test_suite);
 
         currentTest = nullptr;
+        fflush(stdout);
     }
 
     // called when an exception is thrown from the test case (or it crashes)
@@ -152,6 +159,7 @@ struct BoostLikeReporter : doctest::IReporter
         LUAU_ASSERT(currentTest);
 
         printf("%s(%d): FATAL: Unhandled exception %s\n", currentTest->m_file.c_str(), currentTest->m_line, e.error_string.c_str());
+        fflush(stdout);
     }
 
     // called whenever a subcase is entered/exited (noop)
@@ -198,6 +206,7 @@ struct TeamCityReporter : doctest::IReporter
     {
         currentTest = &in;
         printf("##teamcity[testStarted name='%s: %s' captureStandardOutput='true']\n", in.m_test_suite, in.m_name);
+        fflush(stdout);
     }
 
     // called when a test case is reentered because of unfinished subcases
@@ -228,6 +237,7 @@ struct TeamCityReporter : doctest::IReporter
             printf("##teamcity[testFailed name='%s: %s']\n", currentTest->m_test_suite, currentTest->m_name);
 
         printf("##teamcity[testFinished name='%s: %s']\n", currentTest->m_test_suite, currentTest->m_name);
+        fflush(stdout);
     }
 
     void test_case_exception(const doctest::TestCaseException& in) override
@@ -238,6 +248,7 @@ struct TeamCityReporter : doctest::IReporter
             currentTest->m_name,
             in.error_string.c_str()
         );
+        fflush(stdout);
     }
 
     void subcase_start(const doctest::SubcaseSignature& /*in*/) override {}
@@ -392,13 +403,27 @@ int main(int argc, char** argv)
         codegen = true;
     }
 
-    int level = -1;
-    if (doctest::parseIntOption(argc, argv, "-O", doctest::option_int, level))
+    if (doctest::parseFlag(argc, argv, "--jit-inliner"))
     {
-        if (level < 0 || level > 2)
+        jitInliner = true;
+    }
+
+    doctest::String optlevel;
+    if (doctest::parseOption(argc, argv, "-O", &optlevel))
+    {
+        try
+        {
+            int level = std::stoi(optlevel.c_str());
+
+            if (level < 0 || level > 2)
+                fprintf(stderr, "Optimization level must be between 0 and 2 inclusive\n");
+            else
+                optimizationLevel = level;
+        }
+        catch (...)
+        {
             fprintf(stderr, "Optimization level must be between 0 and 2 inclusive\n");
-        else
-            optimizationLevel = level;
+        }
     }
 
     int rseed = -1;
@@ -423,6 +448,16 @@ int main(int argc, char** argv)
     doctest::String filter;
     if (doctest::parseOption(argc, argv, "--run_test", &filter) && filter[0] == '=')
     {
+        if (doctest::parseOption(argc, argv, "--run_suites_in_file"))
+        {
+            fprintf(stderr, "ERROR: Cannot pass both --run_test and --run_suites_in_file\n");
+            return 1;
+        }
+        if (doctest::parseOption(argc, argv, "--run_cases_in_file"))
+        {
+            fprintf(stderr, "ERROR: Cannot pass both --run_test and --run_cases_in_file\n");
+            return 1;
+        }
         const char* f = filter.c_str() + 1;
         const char* s = strchr(f, '/');
 
@@ -435,6 +470,28 @@ int main(int argc, char** argv)
         {
             context.addFilter("test-suite", f);
         }
+    }
+
+    doctest::String suite_filter_path;
+    if (doctest::parseOption(argc, argv, "--run_suites_in_file", &suite_filter_path) && suite_filter_path[0] == '=')
+    {
+        const char* filter_file = suite_filter_path.c_str() + 1;
+        std::ifstream filter_stream(filter_file);
+        std::stringstream buffer;
+        buffer << filter_stream.rdbuf();
+        std::string suite_list = buffer.str();
+        context.addFilter("test-suite", suite_list.c_str());
+    }
+
+    doctest::String case_filter_path;
+    if (doctest::parseOption(argc, argv, "--run_cases_in_file", &case_filter_path) && case_filter_path[0] == '=')
+    {
+        const char* filter_file = case_filter_path.c_str() + 1;
+        std::ifstream filter_stream(filter_file);
+        std::stringstream buffer;
+        buffer << filter_stream.rdbuf();
+        std::string case_list = buffer.str();
+        context.addFilter("test-path", case_list.c_str());
     }
 
     // These callbacks register unit tests that need runtime support to be

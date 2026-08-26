@@ -9,17 +9,21 @@
 #include "Luau/Compiler.h"
 #include "Luau/Config.h"
 #include "Luau/Frontend.h"
+#include "Luau/JitInliner.h"
 #include "Luau/Linter.h"
 #include "Luau/ModuleResolver.h"
 #include "Luau/Parser.h"
+#include "Luau/PrettyPrinter.h"
 #include "Luau/ToString.h"
-#include "Luau/Transpiler.h"
+#include "Luau/Type.h"
 #include "Luau/TypeInfer.h"
 
 #include "lua.h"
 #include "lualib.h"
 
 #include <chrono>
+#include <string>
+#include <vector>
 #include <cstring>
 
 static bool getEnvParam(const char* name, bool def)
@@ -36,15 +40,13 @@ const bool kFuzzCompiler = getEnvParam("LUAU_FUZZ_COMPILER", true);
 const bool kFuzzLinter = getEnvParam("LUAU_FUZZ_LINTER", true);
 const bool kFuzzTypeck = getEnvParam("LUAU_FUZZ_TYPE_CHECK", true);
 const bool kFuzzVM = getEnvParam("LUAU_FUZZ_VM", true);
-const bool kFuzzTranspile = getEnvParam("LUAU_FUZZ_TRANSPILE", true);
+const bool kFuzzPrettyPrint = getEnvParam("LUAU_FUZZ_PRETTY_PRINT", true);
 const bool kFuzzCodegenVM = getEnvParam("LUAU_FUZZ_CODEGEN_VM", true);
 const bool kFuzzCodegenAssembly = getEnvParam("LUAU_FUZZ_CODEGEN_ASM", true);
-const bool kFuzzUseNewSolver = getEnvParam("LUAU_FUZZ_NEW_SOLVER", false);
+const bool kFuzzJitInliner = getEnvParam("LUAU_FUZZ_JIT_INLINER", true);
 
 // Should we generate type annotations?
 const bool kFuzzTypes = getEnvParam("LUAU_FUZZ_GEN_TYPES", true);
-
-const Luau::CodeGen::AssemblyOptions::Target kFuzzCodegenTarget = Luau::CodeGen::AssemblyOptions::A64;
 
 std::vector<std::string> protoprint(const luau::ModuleSet& stat, bool types);
 
@@ -54,9 +56,13 @@ LUAU_FASTINT(LuauCheckRecursionLimit)
 LUAU_FASTINT(LuauTableTypeMaximumStringifierLength)
 LUAU_FASTINT(LuauTypeInferIterationLimit)
 LUAU_FASTINT(LuauTarjanChildLimit)
+LUAU_FASTINT(DebugLuauTypeFunctionRuntimeHeapLimit)
 LUAU_FASTFLAG(DebugLuauFreezeArena)
 LUAU_FASTFLAG(DebugLuauAbortingChecks)
-LUAU_FASTFLAG(DebugLuauDeferredConstraintResolution)
+LUAU_FASTFLAG(DebugLuauUserDefinedClasses)
+LUAU_FASTFLAG(DebugLuauUserDefinedClassesRuntime)
+
+const double kTypecheckTimeoutSec = 4.0;
 
 std::chrono::milliseconds kInterruptTimeout(10);
 std::chrono::time_point<std::chrono::system_clock> interruptDeadline;
@@ -96,6 +102,11 @@ void* allocate(void* ud, void* ptr, size_t osize, size_t nsize)
     }
 }
 
+int lua_silence(lua_State* L)
+{
+    return 0;
+}
+
 lua_State* createGlobalState()
 {
     lua_State* L = lua_newstate(allocate, NULL);
@@ -106,6 +117,15 @@ lua_State* createGlobalState()
     lua_callbacks(L)->interrupt = interrupt;
 
     luaL_openlibs(L);
+
+    std::vector<luaL_Reg> funcs;
+    funcs.push_back({"print", lua_silence}); // do not let fuzz input to print to stdout
+    funcs.push_back({nullptr, nullptr});     // "null" terminate the list of functions to register
+
+    lua_pushvalue(L, LUA_GLOBALSINDEX);
+    luaL_register(L, nullptr, funcs.data());
+    lua_pop(L, 1);
+
     luaL_sandbox(L);
 
     return L;
@@ -124,8 +144,8 @@ int registerTypes(Luau::Frontend& frontend, Luau::GlobalTypes& globals, bool for
     // Vector3 stub
     TypeId vector3MetaType = arena.addType(TableType{});
 
-    TypeId vector3InstanceType = arena.addType(ClassType{"Vector3", {}, nullopt, vector3MetaType, {}, {}, "Test", {}});
-    getMutable<ClassType>(vector3InstanceType)->props = {
+    TypeId vector3InstanceType = arena.addType(ExternType{"Vector3", {}, nullopt, vector3MetaType, {}, {}, "Test", {}});
+    getMutable<ExternType>(vector3InstanceType)->props = {
         {"X", {builtinTypes.numberType}},
         {"Y", {builtinTypes.numberType}},
         {"Z", {builtinTypes.numberType}},
@@ -134,20 +154,21 @@ int registerTypes(Luau::Frontend& frontend, Luau::GlobalTypes& globals, bool for
     getMutable<TableType>(vector3MetaType)->props = {
         {"__add", {makeFunction(arena, nullopt, {vector3InstanceType, vector3InstanceType}, {vector3InstanceType})}},
     };
+    getMutable<TableType>(vector3MetaType)->state = TableState::Sealed;
 
     globals.globalScope->exportedTypeBindings["Vector3"] = TypeFun{{}, vector3InstanceType};
 
     // Instance stub
-    TypeId instanceType = arena.addType(ClassType{"Instance", {}, nullopt, nullopt, {}, {}, "Test", {}});
-    getMutable<ClassType>(instanceType)->props = {
+    TypeId instanceType = arena.addType(ExternType{"Instance", {}, nullopt, nullopt, {}, {}, "Test", {}});
+    getMutable<ExternType>(instanceType)->props = {
         {"Name", {builtinTypes.stringType}},
     };
 
     globals.globalScope->exportedTypeBindings["Instance"] = TypeFun{{}, instanceType};
 
     // Part stub
-    TypeId partType = arena.addType(ClassType{"Part", {}, instanceType, nullopt, {}, {}, "Test", {}});
-    getMutable<ClassType>(partType)->props = {
+    TypeId partType = arena.addType(ExternType{"Part", {}, instanceType, nullopt, {}, {}, "Test", {}});
+    getMutable<ExternType>(partType)->props = {
         {"Position", {vector3InstanceType}},
     };
 
@@ -174,6 +195,19 @@ static void setupFrontend(Luau::Frontend& frontend)
     };
 }
 
+static Luau::FrontendOptions getFrontendOptions()
+{
+    Luau::FrontendOptions options;
+
+    options.retainFullTypeGraphs = true;
+    options.forAutocomplete = false;
+    options.runLintChecks = kFuzzLinter;
+
+    options.moduleTimeLimitSec = kTypecheckTimeoutSec;
+
+    return options;
+}
+
 struct FuzzFileResolver : Luau::FileResolver
 {
     std::optional<Luau::SourceCode> readSource(const Luau::ModuleName& name) override
@@ -185,7 +219,7 @@ struct FuzzFileResolver : Luau::FileResolver
         return Luau::SourceCode{it->second, Luau::SourceCode::Module};
     }
 
-    std::optional<Luau::ModuleInfo> resolveModule(const Luau::ModuleInfo* context, Luau::AstExpr* expr) override
+    std::optional<Luau::ModuleInfo> resolveModule(const Luau::ModuleInfo* context, Luau::AstExpr* expr, const Luau::TypeCheckLimits& _limits) override
     {
         if (Luau::AstExprGlobal* g = expr->as<Luau::AstExprGlobal>())
             return Luau::ModuleInfo{g->name.value};
@@ -215,7 +249,7 @@ struct FuzzConfigResolver : Luau::ConfigResolver
         defaultConfig.parseOptions.captureComments = true;
     }
 
-    virtual const Luau::Config& getConfig(const Luau::ModuleName& name) const override
+    virtual const Luau::Config& getConfig(const Luau::ModuleName& name, const Luau::TypeCheckLimits& _limits) const override
     {
         return defaultConfig;
     }
@@ -240,14 +274,21 @@ DEFINE_PROTO_FUZZER(const luau::ModuleSet& message)
     FInt::LuauTypeInferIterationLimit.value = 1000;
     FInt::LuauTarjanChildLimit.value = 1000;
     FInt::LuauTableTypeMaximumStringifierLength.value = 100;
+    // Limit the heap size for type functions to ~512 MB to avoid
+    // the fuzzing infrastructure claiming we OOM'd because you can
+    // make a 4GB table.
+    FInt::DebugLuauTypeFunctionRuntimeHeapLimit = 512 * 1024 * 1024;
 
     for (Luau::FValue<bool>* flag = Luau::FValue<bool>::list; flag; flag = flag->next)
+    {
         if (strncmp(flag->name, "Luau", 4) == 0)
             flag->value = true;
+    }
 
     FFlag::DebugLuauFreezeArena.value = true;
     FFlag::DebugLuauAbortingChecks.value = true;
-    FFlag::DebugLuauDeferredConstraintResolution.value = kFuzzUseNewSolver;
+    FFlag::DebugLuauUserDefinedClasses.value = true;
+    FFlag::DebugLuauUserDefinedClassesRuntime.value = true;
 
     std::vector<std::string> sources = protoprint(message, kFuzzTypes);
 
@@ -269,6 +310,7 @@ DEFINE_PROTO_FUZZER(const luau::ModuleSet& message)
 
     Luau::ParseOptions parseOptions;
     parseOptions.captureComments = true;
+    parseOptions.storeCstData = kFuzzPrettyPrint;
 
     std::vector<Luau::ParseResult> parseResults;
 
@@ -285,8 +327,8 @@ DEFINE_PROTO_FUZZER(const luau::ModuleSet& message)
     {
         static FuzzFileResolver fileResolver;
         static FuzzConfigResolver configResolver;
-        static Luau::FrontendOptions defaultOptions{/*retainFullTypeGraphs*/ true, /*forAutocomplete*/ false, /*runLintChecks*/ kFuzzLinter};
-        static Luau::Frontend frontend(&fileResolver, &configResolver, defaultOptions);
+        static Luau::FrontendOptions defaultOptions = getFrontendOptions();
+        static Luau::Frontend frontend(Luau::SolverMode::New, &fileResolver, &configResolver, defaultOptions);
 
         static int once = (setupFrontend(frontend), 0);
         (void)once;
@@ -335,16 +377,18 @@ DEFINE_PROTO_FUZZER(const luau::ModuleSet& message)
         }
     }
 
-    if (kFuzzTranspile)
+    if (kFuzzPrettyPrint)
     {
         for (Luau::ParseResult& parseResult : parseResults)
         {
             if (parseResult.root)
-                transpileWithTypes(*parseResult.root);
+                prettyPrintWithTypes(*parseResult.root);
         }
     }
 
-    std::string bytecode;
+    // we use separate strings and code paths for easier crash debugging using lines in backtrace
+    std::string bytecodeO1;
+    std::string bytecodeO2;
 
     // compile
     if (kFuzzCompiler)
@@ -360,9 +404,18 @@ DEFINE_PROTO_FUZZER(const luau::ModuleSet& message)
 
                 try
                 {
+                    // check with default options
                     Luau::BytecodeBuilder bcb;
                     Luau::compileOrThrow(bcb, parseResult, parseNameTable, compileOptions);
-                    bytecode = bcb.getBytecode();
+                    bytecodeO1 = bcb.getBytecode();
+
+                    // check with all optimizations
+                    compileOptions.optimizationLevel = 2;
+                    compileOptions.typeInfoLevel = 1;
+
+                    Luau::BytecodeBuilder bcb2;
+                    Luau::compileOrThrow(bcb2, parseResult, parseNameTable, compileOptions);
+                    bytecodeO2 = bcb2.getBytecode();
                 }
                 catch (const Luau::CompileError&)
                 {
@@ -373,27 +426,42 @@ DEFINE_PROTO_FUZZER(const luau::ModuleSet& message)
     }
 
     // run codegen on resulting bytecode (in separate state)
-    if (kFuzzCodegenAssembly && bytecode.size())
+    if (kFuzzCodegenAssembly)
     {
-        static lua_State* globalState = luaL_newstate();
-
-        if (luau_load(globalState, "=fuzz", bytecode.data(), bytecode.size(), 0) == 0)
+        auto loadAndCheckAssembly = [](const std::string& bytecode)
         {
-            Luau::CodeGen::AssemblyOptions options;
-            options.compilationOptions.flags = Luau::CodeGen::CodeGen_ColdFunctions;
-            options.outputBinary = true;
-            options.target = kFuzzCodegenTarget;
-            Luau::CodeGen::getAssembly(globalState, -1, options);
-        }
+            static lua_State* globalState = luaL_newstate();
 
-        lua_pop(globalState, 1);
-        lua_gc(globalState, LUA_GCCOLLECT, 0);
+            if (luau_load(globalState, "=fuzz", bytecode.data(), bytecode.size(), 0) == 0)
+            {
+                Luau::CodeGen::AssemblyOptions options;
+                options.compilationOptions.flags = Luau::CodeGen::CodeGen_ColdFunctions;
+                options.outputBinary = true;
+
+                options.target = Luau::CodeGen::AssemblyOptions::A64;
+                Luau::CodeGen::getAssembly(globalState, -1, options);
+
+                options.target = Luau::CodeGen::AssemblyOptions::X64_SystemV;
+                Luau::CodeGen::getAssembly(globalState, -1, options);
+            }
+
+            lua_pop(globalState, 1);
+            lua_gc(globalState, LUA_GCCOLLECT, 0);
+        };
+
+        if (!bytecodeO1.empty())
+            loadAndCheckAssembly(bytecodeO1);
+
+        if (!bytecodeO2.empty())
+            loadAndCheckAssembly(bytecodeO2);
     }
 
     // run resulting bytecode (from last successfully compiler module)
-    if ((kFuzzVM || kFuzzCodegenVM) && bytecode.size())
+    if (kFuzzVM || kFuzzCodegenVM)
     {
         static lua_State* globalState = createGlobalState();
+        if (kFuzzJitInliner)
+            Luau::JitInliner::setup(globalState);
 
         auto runCode = [](const std::string& bytecode, bool useCodegen)
         {
@@ -414,13 +482,19 @@ DEFINE_PROTO_FUZZER(const luau::ModuleSet& message)
 
             // we'd expect full GC to reclaim all memory allocated by the script
             lua_gc(globalState, LUA_GCCOLLECT, 0);
-            LUAU_ASSERT(heapSize < 256 * 1024);
+            LUAU_ASSERT(heapSize < 320 * 1024);
         };
 
-        if (kFuzzVM)
-            runCode(bytecode, false);
+        if (kFuzzVM && !bytecodeO1.empty())
+            runCode(bytecodeO1, false);
 
-        if (kFuzzCodegenVM && Luau::CodeGen::isSupported())
-            runCode(bytecode, true);
+        if (kFuzzCodegenVM && !bytecodeO1.empty() && Luau::CodeGen::isSupported())
+            runCode(bytecodeO1, true);
+
+        if (kFuzzVM && !bytecodeO2.empty())
+            runCode(bytecodeO2, false);
+
+        if (kFuzzCodegenVM && !bytecodeO2.empty() && Luau::CodeGen::isSupported())
+            runCode(bytecodeO2, true);
     }
 }

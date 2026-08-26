@@ -1,6 +1,7 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/AstQuery.h"
 
+#include "Luau/Frontend.h"
 #include "Luau/Module.h"
 #include "Luau/Scope.h"
 #include "Luau/TypeInfer.h"
@@ -10,9 +11,6 @@
 #include "Luau/Common.h"
 
 #include <algorithm>
-
-LUAU_FASTFLAG(DebugLuauDeferredConstraintResolution);
-LUAU_FASTFLAGVARIABLE(LuauFixBindingForGlobalPos, false);
 
 namespace Luau
 {
@@ -32,7 +30,8 @@ struct AutocompleteNodeFinder : public AstVisitor
 
     bool visit(AstExpr* expr) override
     {
-        if (expr->location.begin <= pos && pos <= expr->location.end)
+        // If the expression size is 0 (begin == end), we don't want to include it in the ancestry
+        if (expr->location.begin <= pos && pos <= expr->location.end && expr->location.begin != expr->location.end)
         {
             ancestry.push_back(expr);
             return true;
@@ -42,11 +41,15 @@ struct AutocompleteNodeFinder : public AstVisitor
 
     bool visit(AstStat* stat) override
     {
-        if (stat->location.begin < pos && pos <= stat->location.end)
+        // Consider 'local myLocal = 4;|' and 'local myLocal = 4', where '|' is the cursor position. In both cases, the cursor position is equal
+        // to `AstStatLocal.location.end`. However, in the first case (semicolon), we are starting a new statement, whilst in the second case
+        // (no semicolon) we are still part of the AstStatLocal, hence the different comparison check.
+        if (stat->location.begin < pos && (stat->hasSemicolon ? pos < stat->location.end : pos <= stat->location.end))
         {
             ancestry.push_back(stat);
             return true;
         }
+
         return false;
     }
 
@@ -327,7 +330,7 @@ static std::optional<AstStatLocal*> findBindingLocalStatement(const SourceModule
 {
     // Bindings coming from global sources (e.g., definition files) have a zero position.
     // They cannot be defined from a local statement
-    if (FFlag::LuauFixBindingForGlobalPos && binding.location == Location{{0, 0}, {0, 0}})
+    if (binding.location == Location{{0, 0}, {0, 0}})
         return std::nullopt;
 
     std::vector<AstNode*> nodes = findAstAncestryOfPosition(source, binding.location.begin);
@@ -344,15 +347,20 @@ static std::optional<AstStatLocal*> findBindingLocalStatement(const SourceModule
 
 std::optional<Binding> findBindingAtPosition(const Module& module, const SourceModule& source, Position pos)
 {
-    AstExpr* expr = findExprAtPosition(source, pos);
-    if (!expr)
-        return std::nullopt;
+    ExprOrLocal exprOrLocal = findExprOrLocalAtPosition(source, pos);
 
     Symbol name;
-    if (auto g = expr->as<AstExprGlobal>())
-        name = g->name;
-    else if (auto l = expr->as<AstExprLocal>())
-        name = l->local;
+    if (auto expr = exprOrLocal.getExpr())
+    {
+        if (auto g = expr->as<AstExprGlobal>())
+            name = g->name;
+        else if (auto l = expr->as<AstExprLocal>())
+            name = l->local;
+        else
+            return std::nullopt;
+    }
+    else if (auto local = exprOrLocal.getLocal())
+        name = local;
     else
         return std::nullopt;
 
@@ -443,7 +451,7 @@ struct FindExprOrLocal : public AstVisitor
         return true;
     }
 
-    virtual bool visit(AstExprFunction* fn) override
+    bool visit(AstExprFunction* fn) override
     {
         for (size_t i = 0; i < fn->args.size; ++i)
         {
@@ -452,13 +460,13 @@ struct FindExprOrLocal : public AstVisitor
         return visit((class AstExpr*)fn);
     }
 
-    virtual bool visit(AstStatFor* forStat) override
+    bool visit(AstStatFor* forStat) override
     {
         visitLocal(forStat->var);
         return true;
     }
 
-    virtual bool visit(AstStatForIn* forIn) override
+    bool visit(AstStatForIn* forIn) override
     {
         for (AstLocal* var : forIn->vars)
         {
@@ -480,7 +488,7 @@ static std::optional<DocumentationSymbol> checkOverloadedDocumentationSymbol(
     const Module& module,
     const TypeId ty,
     const AstExpr* parentExpr,
-    const std::optional<DocumentationSymbol> documentationSymbol
+    std::optional<DocumentationSymbol> documentationSymbol
 )
 {
     if (!documentationSymbol)
@@ -510,15 +518,45 @@ static std::optional<DocumentationSymbol> checkOverloadedDocumentationSymbol(
     return documentationSymbol;
 }
 
+static std::optional<DocumentationSymbol> getMetatableDocumentation(
+    const Module& module,
+    AstExpr* parentExpr,
+    const TableType* mtable,
+    const AstName& index
+)
+{
+    auto indexIt = mtable->props.find("__index");
+    if (indexIt == mtable->props.end())
+        return std::nullopt;
+
+    TypeId followed;
+    if (indexIt->second.readTy)
+        followed = follow(*indexIt->second.readTy);
+    else if (indexIt->second.writeTy)
+        followed = follow(*indexIt->second.writeTy);
+    else
+        return std::nullopt;
+
+    const TableType* ttv = get<TableType>(followed);
+    if (!ttv)
+        return std::nullopt;
+
+    auto propIt = ttv->props.find(index.value);
+    if (propIt == ttv->props.end())
+        return std::nullopt;
+
+    if (auto ty = propIt->second.readTy)
+        return checkOverloadedDocumentationSymbol(module, *ty, parentExpr, propIt->second.documentationSymbol);
+
+    return std::nullopt;
+}
+
 std::optional<DocumentationSymbol> getDocumentationSymbolAtPosition(const SourceModule& source, const Module& module, Position position)
 {
     std::vector<AstNode*> ancestry = findAstAncestryOfPosition(source, position);
 
     AstExpr* targetExpr = ancestry.size() >= 1 ? ancestry[ancestry.size() - 1]->asExpr() : nullptr;
     AstExpr* parentExpr = ancestry.size() >= 2 ? ancestry[ancestry.size() - 2]->asExpr() : nullptr;
-
-    if (std::optional<Binding> binding = findBindingAtPosition(module, source, position))
-        return checkOverloadedDocumentationSymbol(module, binding->typeId, parentExpr, binding->documentationSymbol);
 
     if (targetExpr)
     {
@@ -531,26 +569,29 @@ std::optional<DocumentationSymbol> getDocumentationSymbolAtPosition(const Source
                 {
                     if (auto propIt = ttv->props.find(indexName->index.value); propIt != ttv->props.end())
                     {
-                        if (FFlag::DebugLuauDeferredConstraintResolution)
-                        {
-                            if (auto ty = propIt->second.readTy)
-                                return checkOverloadedDocumentationSymbol(module, *ty, parentExpr, propIt->second.documentationSymbol);
-                        }
-                        else
-                            return checkOverloadedDocumentationSymbol(module, propIt->second.type(), parentExpr, propIt->second.documentationSymbol);
+                        if (auto ty = propIt->second.readTy)
+                            return checkOverloadedDocumentationSymbol(module, *ty, parentExpr, propIt->second.documentationSymbol);
                     }
                 }
-                else if (const ClassType* ctv = get<ClassType>(parentTy))
+                else if (const ExternType* etv = get<ExternType>(parentTy))
                 {
-                    if (auto propIt = ctv->props.find(indexName->index.value); propIt != ctv->props.end())
+                    while (etv)
                     {
-                        if (FFlag::DebugLuauDeferredConstraintResolution)
+                        if (auto propIt = etv->props.find(indexName->index.value); propIt != etv->props.end())
                         {
+
                             if (auto ty = propIt->second.readTy)
                                 return checkOverloadedDocumentationSymbol(module, *ty, parentExpr, propIt->second.documentationSymbol);
                         }
-                        else
-                            return checkOverloadedDocumentationSymbol(module, propIt->second.type(), parentExpr, propIt->second.documentationSymbol);
+                        etv = etv->parent ? Luau::get<Luau::ExternType>(*etv->parent) : nullptr;
+                    }
+                }
+                else if (const PrimitiveType* ptv = get<PrimitiveType>(parentTy); ptv && ptv->metatable)
+                {
+                    if (auto mtable = get<TableType>(*ptv->metatable))
+                    {
+                        if (std::optional<std::string> docSymbol = getMetatableDocumentation(module, parentExpr, mtable, indexName->index))
+                            return docSymbol;
                     }
                 }
             }
@@ -587,6 +628,9 @@ std::optional<DocumentationSymbol> getDocumentationSymbolAtPosition(const Source
             }
         }
     }
+
+    if (std::optional<Binding> binding = findBindingAtPosition(module, source, position))
+        return checkOverloadedDocumentationSymbol(module, binding->typeId, parentExpr, binding->documentationSymbol);
 
     if (std::optional<TypeId> ty = findTypeAtPosition(module, source, position))
     {

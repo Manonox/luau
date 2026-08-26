@@ -10,8 +10,8 @@ class IrRegAllocX64Fixture
 {
 public:
     IrRegAllocX64Fixture()
-        : build(/* logText */ true, ABIX64::Windows)
-        , regs(build, function, nullptr)
+        : build(&logger, ABIX64::Windows, /* features */ 0)
+        , regs(&logger, build, function, nullptr)
     {
     }
 
@@ -19,9 +19,11 @@ public:
     {
         build.finalize();
 
-        CHECK("\n" + build.text == expected);
+        CHECK("\n" + logger.text == expected);
     }
 
+    AssemblyOptions options;
+    LogBuilder logger{options};
     AssemblyBuilderX64 build;
     IrFunction function;
     IrRegAllocX64 regs;

@@ -40,7 +40,7 @@ struct Widen : Substitution
     bool ignoreChildren(TypeId ty) override;
 
     TypeId operator()(TypeId ty);
-    TypePackId operator()(TypePackId ty);
+    TypePackId operator()(TypePackId tp);
 };
 
 /**
@@ -56,7 +56,7 @@ struct Widen : Substitution
  * so it is perfectly safe for the function to mutate the table any way it
  * wishes.
  */
-using LiteralProperties = DenseHashSet<Name>;
+using LiteralProperties = DenseHashSet2<Name>;
 
 // TODO: Use this more widely.
 struct UnifierOptions
@@ -80,9 +80,6 @@ struct Unifier
     bool checkInhabited = true; // Normalize types to check if they are inhabited
     CountMismatch::Context ctx = CountMismatch::Arg;
 
-    // If true, generics act as free types when unifying.
-    bool hideousFixMeGenericsAreActuallyFree = false;
-
     UnifierSharedState& sharedState;
 
     // When the Unifier is forced to unify two blocked types (or packs), they
@@ -92,10 +89,6 @@ struct Unifier
     std::vector<TypePackId> blockedTypePacks;
 
     Unifier(NotNull<Normalizer> normalizer, NotNull<Scope> scope, const Location& location, Variance variance, TxnLog* parentLog = nullptr);
-
-    // Configure the Unifier to test for scope subsumption via embedded Scope
-    // pointers rather than TypeLevels.
-    void enableNewSolver();
 
     // Test whether the two type vars unify.  Never commits the result.
     ErrorVec canUnify(TypeId subTy, TypeId superTy);
@@ -110,7 +103,7 @@ struct Unifier
         TypeId superTy,
         bool isFunctionCall = false,
         bool isIntersection = false,
-        const LiteralProperties* aliasableMap = nullptr
+        const LiteralProperties* literalProperties = nullptr
     );
 
 private:
@@ -119,9 +112,9 @@ private:
         TypeId superTy,
         bool isFunctionCall = false,
         bool isIntersection = false,
-        const LiteralProperties* aliasableMap = nullptr
+        const LiteralProperties* literalProperties = nullptr
     );
-    void tryUnifyUnionWithType(TypeId subTy, const UnionType* uv, TypeId superTy);
+    void tryUnifyUnionWithType(TypeId subTy, const UnionType* subUnion, TypeId superTy);
 
     // Traverse the two types provided and block on any BlockedTypes we find.
     // Returns true if any types were blocked on.
@@ -141,10 +134,10 @@ private:
     void tryUnifyPrimitives(TypeId subTy, TypeId superTy);
     void tryUnifySingletons(TypeId subTy, TypeId superTy);
     void tryUnifyFunctions(TypeId subTy, TypeId superTy, bool isFunctionCall = false);
-    void tryUnifyTables(TypeId subTy, TypeId superTy, bool isIntersection = false, const LiteralProperties* aliasableMap = nullptr);
+    void tryUnifyTables(TypeId subTy, TypeId superTy, bool isIntersection = false, const LiteralProperties* literalProperties = nullptr);
     void tryUnifyScalarShape(TypeId subTy, TypeId superTy, bool reversed);
     void tryUnifyWithMetatable(TypeId subTy, TypeId superTy, bool reversed);
-    void tryUnifyWithClass(TypeId subTy, TypeId superTy, bool reversed);
+    void tryUnifyWithExternType(TypeId subTy, TypeId superTy, bool reversed);
     void tryUnifyNegations(TypeId subTy, TypeId superTy);
 
     TypePackId tryApplyOverloadedFunction(TypeId function, const NormalizedFunctionType& overloads, TypePackId args);
@@ -158,28 +151,27 @@ private:
     void cacheResult(TypeId subTy, TypeId superTy, size_t prevErrorCount);
 
 public:
-    void tryUnify(TypePackId subTy, TypePackId superTy, bool isFunctionCall = false);
+    void tryUnify(TypePackId subTp, TypePackId superTp, bool isFunctionCall = false);
 
 private:
-    void tryUnify_(TypePackId subTy, TypePackId superTy, bool isFunctionCall = false);
-    void tryUnifyVariadics(TypePackId subTy, TypePackId superTy, bool reversed, int subOffset = 0);
+    void tryUnify_(TypePackId subTp, TypePackId superTp, bool isFunctionCall = false);
+    void tryUnifyVariadics(TypePackId subTp, TypePackId superTp, bool reversed, int subOffset = 0);
 
     void tryUnifyWithAny(TypeId subTy, TypeId anyTy);
     void tryUnifyWithAny(TypePackId subTy, TypePackId anyTp);
 
     std::optional<TypeId> findTablePropertyRespectingMeta(TypeId lhsType, Name name);
 
-    TxnLog combineLogsIntoIntersection(std::vector<TxnLog> logs);
     TxnLog combineLogsIntoUnion(std::vector<TxnLog> logs);
 
 public:
     // Returns true if the type "needle" already occurs within "haystack" and reports an "infinite type error"
     bool occursCheck(TypeId needle, TypeId haystack, bool reversed);
-    bool occursCheck(DenseHashSet<TypeId>& seen, TypeId needle, TypeId haystack);
+    bool occursCheck(DenseHashSet2<TypeId>& seen, TypeId needle, TypeId haystack);
     bool occursCheck(TypePackId needle, TypePackId haystack, bool reversed);
-    bool occursCheck(DenseHashSet<TypePackId>& seen, TypePackId needle, TypePackId haystack);
+    bool occursCheck(DenseHashSet2<TypePackId>& seen, TypePackId needle, TypePackId haystack);
 
-    Unifier makeChildUnifier();
+    std::unique_ptr<Unifier> makeChildUnifier();
 
     void reportError(TypeError err);
     LUAU_NOINLINE void reportError(Location location, TypeErrorData data);
@@ -195,11 +187,6 @@ private:
 
     // Available after regular type pack unification errors
     std::optional<int> firstPackErrorPos;
-
-    // If true, we do a bunch of small things differently to work better with
-    // the new type inference engine. Most notably, we use the Scope hierarchy
-    // directly rather than using TypeLevels.
-    bool useNewSolver = false;
 };
 
 void promoteTypeLevels(TxnLog& log, const TypeArena* arena, TypeLevel minLevel, Scope* outerScope, bool useScope, TypePackId tp);

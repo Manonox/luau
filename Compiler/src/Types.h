@@ -3,7 +3,8 @@
 
 #include "Luau/Ast.h"
 #include "Luau/Bytecode.h"
-#include "Luau/DenseHash.h"
+#include "Luau/Compiler.h"
+#include "Luau/DenseHash2.h"
 #include "ValueTracking.h"
 
 #include <string>
@@ -14,28 +15,32 @@ class BytecodeBuilder;
 
 struct BuiltinAstTypes
 {
-    BuiltinAstTypes(const char* vectorType)
-        : vectorType{{}, std::nullopt, AstName{vectorType}, std::nullopt, {}}
+    BuiltinAstTypes(const char* hostVectorType)
+        : hostVectorType{{}, std::nullopt, AstName{hostVectorType}, std::nullopt, {}}
     {
     }
 
-    // AstName use here will not match the AstNameTable, but the was we use them here always force a full string compare
+    // AstName use here will not match the AstNameTable, but the way we use them here always forces a full string compare
     AstTypeReference booleanType{{}, std::nullopt, AstName{"boolean"}, std::nullopt, {}};
     AstTypeReference numberType{{}, std::nullopt, AstName{"number"}, std::nullopt, {}};
+    AstTypeReference integerType{{}, std::nullopt, AstName{"integer"}, std::nullopt, {}};
     AstTypeReference stringType{{}, std::nullopt, AstName{"string"}, std::nullopt, {}};
-    AstTypeReference vectorType;
+    AstTypeReference vectorType{{}, std::nullopt, AstName{"vector"}, std::nullopt, {}};
+
+    AstTypeReference hostVectorType;
 };
 
 void buildTypeMap(
-    DenseHashMap<AstExprFunction*, std::string>& functionTypes,
-    DenseHashMap<AstLocal*, LuauBytecodeType>& localTypes,
-    DenseHashMap<AstExpr*, LuauBytecodeType>& exprTypes,
+    DenseHashMap2<AstExprFunction*, std::string>& functionTypes,
+    DenseHashMap2<AstLocal*, LuauBytecodeType>& localTypes,
+    DenseHashMap2<AstExpr*, LuauBytecodeType>& exprTypes,
     AstNode* root,
-    const char* vectorType,
-    const DenseHashMap<AstName, uint8_t>& userdataTypes,
+    const char* hostVectorType,
+    const DenseHashMap2<AstName, uint8_t>& userdataTypes,
     const BuiltinAstTypes& builtinTypes,
-    const DenseHashMap<AstExprCall*, int>& builtinCalls,
-    const DenseHashMap<AstName, Compile::Global>& globals,
+    const DenseHashMap2<AstExprCall*, int>& builtinCalls,
+    const DenseHashMap2<AstName, Compile::Global>& globals,
+    LibraryMemberTypeCallback libraryMemberTypeCb,
     BytecodeBuilder& bytecode
 );
 

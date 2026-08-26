@@ -4,11 +4,15 @@
 
 #include "Fixture.h"
 
+#include "ScopedFlags.h"
 #include "doctest.h"
 
 using namespace Luau;
 
-LUAU_FASTFLAG(DebugLuauDeferredConstraintResolution);
+LUAU_FASTFLAG(LuauCheckFunctionStatementTypes)
+LUAU_FASTFLAG(DebugLuauForceOldSolver)
+LUAU_FASTFLAG(LuauDropUnionSubtypeReasoning)
+LUAU_FASTFLAG(LuauNewTypePathErrorMessages)
 
 TEST_SUITE_BEGIN("IntersectionTypes");
 
@@ -171,10 +175,10 @@ TEST_CASE_FIXTURE(Fixture, "index_on_an_intersection_type_with_property_guarante
 
     LUAU_REQUIRE_NO_ERRORS(result);
 
-    if (FFlag::DebugLuauDeferredConstraintResolution)
+    if (!FFlag::DebugLuauForceOldSolver)
         CHECK("(A & B) -> { y: number }" == toString(requireType("f")));
     else
-        CHECK("(A & B) -> {| y: number |} & {| y: number |}" == toString(requireType("f")));
+        CHECK("(A & B) -> { y: number } & { y: number }" == toString(requireType("f")));
 }
 
 TEST_CASE_FIXTURE(Fixture, "index_on_an_intersection_type_works_at_arbitrary_depth")
@@ -190,7 +194,7 @@ TEST_CASE_FIXTURE(Fixture, "index_on_an_intersection_type_works_at_arbitrary_dep
 
     LUAU_REQUIRE_NO_ERRORS(result);
 
-    if (FFlag::DebugLuauDeferredConstraintResolution)
+    if (!FFlag::DebugLuauForceOldSolver)
         CHECK_EQ("(A & B) -> string", toString(requireType("f")));
     else
         CHECK_EQ("(A & B) -> string & string", toString(requireType("f")));
@@ -209,7 +213,7 @@ TEST_CASE_FIXTURE(Fixture, "index_on_an_intersection_type_with_mixed_types")
 
     LUAU_REQUIRE_NO_ERRORS(result);
 
-    if (FFlag::DebugLuauDeferredConstraintResolution)
+    if (!FFlag::DebugLuauForceOldSolver)
         CHECK_EQ("(A & B) -> never", toString(requireType("f")));
     else
         CHECK_EQ("(A & B) -> number & string", toString(requireType("f")));
@@ -331,6 +335,8 @@ TEST_CASE_FIXTURE(Fixture, "table_intersection_write_sealed")
 
 TEST_CASE_FIXTURE(Fixture, "table_intersection_write_sealed_indirect")
 {
+    ScopedFastFlag _{FFlag::LuauCheckFunctionStatementTypes, true};
+
     CheckResult result = check(R"(
         type X = { x: (number) -> number }
         type Y = { y: (string) -> string }
@@ -344,30 +350,39 @@ TEST_CASE_FIXTURE(Fixture, "table_intersection_write_sealed_indirect")
         end
     )");
 
-    if (FFlag::DebugLuauDeferredConstraintResolution)
+    LUAU_REQUIRE_ERROR_COUNT(4, result);
+    if (!FFlag::DebugLuauForceOldSolver)
     {
-        LUAU_REQUIRE_ERROR_COUNT(2, result);
         CHECK_EQ(toString(result.errors[0]), "Cannot add property 'z' to table 'X & Y'");
-        CHECK_EQ(toString(result.errors[1]), "Cannot add property 'w' to table 'X & Y'");
+        auto err1 = get<TypeMismatch>(result.errors[1]);
+        REQUIRE(err1);
+        CHECK_EQ("number", toString(err1->givenType));
+        CHECK_EQ("string", toString(err1->wantedType));
+        auto err2 = get<TypeMismatch>(result.errors[2]);
+        REQUIRE(err2);
+        CHECK_EQ("(string, number) -> string", toString(err2->givenType));
+        CHECK_EQ("(string) -> string", toString(err2->wantedType));
+        CHECK_EQ(toString(result.errors[3]), "Cannot add property 'w' to table 'X & Y'");
     }
     else
     {
-        LUAU_REQUIRE_ERROR_COUNT(4, result);
-        const std::string expected = R"(Type
-    '(string, number) -> string'
-could not be converted into
-    '(string) -> string'
-caused by:
-  Argument count mismatch. Function expects 2 arguments, but only 1 is specified)";
+        const std::string expected = "Expected this to be\n\t"
+                                     "'(string) -> string'"
+                                     "\nbut got\n\t"
+                                     "'(string, number) -> string'"
+                                     "\ncaused by:\n"
+                                     "  Argument count mismatch. Function expects 2 arguments, but only 1 is specified";
+
         CHECK_EQ(expected, toString(result.errors[0]));
         CHECK_EQ(toString(result.errors[1]), "Cannot add property 'z' to table 'X & Y'");
-        CHECK_EQ(toString(result.errors[2]), "Type 'number' could not be converted into 'string'");
+        CHECK_EQ(toString(result.errors[2]), "Expected this to be 'string', but got 'number'");
         CHECK_EQ(toString(result.errors[3]), "Cannot add property 'w' to table 'X & Y'");
     }
 }
 
 TEST_CASE_FIXTURE(Fixture, "table_write_sealed_indirect")
 {
+    DOES_NOT_PASS_NEW_SOLVER_GUARD();
     // After normalization, previous 'table_intersection_write_sealed_indirect' is identical to this one
     CheckResult result = check(R"(
     type XY = { x: (number) -> number, y: (string) -> string }
@@ -382,16 +397,16 @@ TEST_CASE_FIXTURE(Fixture, "table_write_sealed_indirect")
     )");
 
     LUAU_REQUIRE_ERROR_COUNT(4, result);
-    const std::string expected = R"(Type
-    '(string, number) -> string'
-could not be converted into
-    '(string) -> string'
-caused by:
-  Argument count mismatch. Function expects 2 arguments, but only 1 is specified)";
+    const std::string expected = "Expected this to be\n\t"
+                                 "'(string) -> string'"
+                                 "\nbut got\n\t"
+                                 "'(string, number) -> string'"
+                                 "\ncaused by:\n"
+                                 "  Argument count mismatch. Function expects 2 arguments, but only 1 is specified";
     CHECK_EQ(expected, toString(result.errors[0]));
 
     CHECK_EQ(toString(result.errors[1]), "Cannot add property 'z' to table 'XY'");
-    CHECK_EQ(toString(result.errors[2]), "Type 'number' could not be converted into 'string'");
+    CHECK_EQ(toString(result.errors[2]), "Expected this to be 'string', but got 'number'");
     CHECK_EQ(toString(result.errors[3]), "Cannot add property 'w' to table 'XY'");
 }
 
@@ -417,18 +432,31 @@ local a: XYZ = 3
     )");
 
     LUAU_REQUIRE_ERROR_COUNT(1, result);
-    const std::string expected = R"(Type 'number' could not be converted into 'X & Y & Z'
+
+    if (!FFlag::DebugLuauForceOldSolver)
+    {
+        const std::string expected = FFlag::LuauNewTypePathErrorMessages
+                                         ? "Expected this to be 'X & Y & Z', but got 'number'; \n"
+                                           "this is because \n\t"
+                                           " * `number` is not a subtype of `X`\n\t"
+                                           " * `number` is not a subtype of `Y`\n\t"
+                                           " * `number` is not a subtype of `Z`"
+                                         : "Expected this to be 'X & Y & Z', but got 'number'; \n"
+                                           "this is because \n\t"
+                                           " * the 1st component of the intersection is `X`, and `number` is not a subtype of `X`\n\t"
+                                           " * the 2nd component of the intersection is `Y`, and `number` is not a subtype of `Y`\n\t"
+                                           " * the 3rd component of the intersection is `Z`, and `number` is not a subtype of `Z`";
+        CHECK_EQ(expected, toString(result.errors[0]));
+    }
+    else
+    {
+        const std::string expected = R"(Expected this to be 'X & Y & Z', but got 'number'
 caused by:
   Not all intersection parts are compatible.
-Type 'number' could not be converted into 'X')";
-    const std::string dcrExprected =
-        R"(Type 'number' could not be converted into 'X & Y & Z'; type number (number) is not a subtype of X & Y & Z[0] (X)
-	type number (number) is not a subtype of X & Y & Z[1] (Y)
-	type number (number) is not a subtype of X & Y & Z[2] (Z))";
-    if (FFlag::DebugLuauDeferredConstraintResolution)
-        CHECK_EQ(dcrExprected, toString(result.errors[0]));
-    else
+Expected this to be 'X', but got 'number')";
+
         CHECK_EQ(expected, toString(result.errors[0]));
+    }
 }
 
 TEST_CASE_FIXTURE(Fixture, "error_detailed_intersection_all")
@@ -445,16 +473,24 @@ end
     )");
 
     LUAU_REQUIRE_ERROR_COUNT(1, result);
-    if (FFlag::DebugLuauDeferredConstraintResolution)
+
+    if (!FFlag::DebugLuauForceOldSolver)
     {
-        CHECK_EQ(R"(Type pack 'X & Y & Z' could not be converted into 'number'; type X & Y & Z[0][0] (X) is not a subtype of number[0] (number)
-	type X & Y & Z[0][1] (Y) is not a subtype of number[0] (number)
-	type X & Y & Z[0][2] (Z) is not a subtype of number[0] (number))",
-            toString(result.errors[0]));
+        const std::string expected = FFlag::LuauNewTypePathErrorMessages
+                                         ? "Expected this to be 'number', but got 'X & Y & Z'; \n"
+                                           "this is because \n\t"
+                                           " * `X` is not a subtype of `number`\n\t"
+                                           " * `Y` is not a subtype of `number`\n\t"
+                                           " * `Z` is not a subtype of `number`"
+                                         : "Expected this to be 'number', but got 'X & Y & Z'; \n"
+                                           "this is because \n\t"
+                                           " * the 1st component of the intersection is `X`, which is not a subtype of `number`\n\t"
+                                           " * the 2nd component of the intersection is `Y`, which is not a subtype of `number`\n\t"
+                                           " * the 3rd component of the intersection is `Z`, which is not a subtype of `number`";
+        CHECK_EQ(expected, toString(result.errors[0]));
     }
     else
-        CHECK_EQ(
-            toString(result.errors[0]), R"(Type 'X & Y & Z' could not be converted into 'number'; none of the intersection parts are compatible)");
+        CHECK_EQ(toString(result.errors[0]), R"(Expected this to be 'number', but got 'X & Y & Z'; none of the intersection parts are compatible)");
 }
 
 TEST_CASE_FIXTURE(Fixture, "overload_is_not_a_function")
@@ -495,15 +531,22 @@ TEST_CASE_FIXTURE(Fixture, "intersect_bool_and_false")
     )");
 
     LUAU_REQUIRE_ERROR_COUNT(1, result);
-    if (FFlag::DebugLuauDeferredConstraintResolution)
+
+    if (!FFlag::DebugLuauForceOldSolver)
     {
-        CHECK_EQ(R"(Type 'boolean & false' could not be converted into 'true'; type boolean & false[0] (boolean) is not a subtype of true (true)
-	type boolean & false[1] (false) is not a subtype of true (true))",
-            toString(result.errors[0]));
+        const std::string expected = FFlag::LuauNewTypePathErrorMessages
+                                         ? "Expected this to be 'true', but got 'boolean & false'; \n"
+                                           "this is because \n\t"
+                                           " * `boolean` is not a subtype of `true`\n\t"
+                                           " * `false` is not a subtype of `true`"
+                                         : "Expected this to be 'true', but got 'boolean & false'; \n"
+                                           "this is because \n\t"
+                                           " * the 1st component of the intersection is `boolean`, which is not a subtype of `true`\n\t"
+                                           " * the 2nd component of the intersection is `false`, which is not a subtype of `true`";
+        CHECK_EQ(expected, toString(result.errors[0]));
     }
     else
-        CHECK_EQ(
-            toString(result.errors[0]), "Type 'boolean & false' could not be converted into 'true'; none of the intersection parts are compatible");
+        CHECK_EQ(toString(result.errors[0]), "Expected this to be 'true', but got 'boolean & false'; none of the intersection parts are compatible");
 }
 
 TEST_CASE_FIXTURE(Fixture, "intersect_false_and_bool_and_false")
@@ -516,57 +559,102 @@ TEST_CASE_FIXTURE(Fixture, "intersect_false_and_bool_and_false")
     )");
 
     LUAU_REQUIRE_ERROR_COUNT(1, result);
+
     // TODO: odd stringification of `false & (boolean & false)`.)
-    if (FFlag::DebugLuauDeferredConstraintResolution)
-        CHECK_EQ(
-            R"(Type 'boolean & false & false' could not be converted into 'true'; type boolean & false & false[0] (false) is not a subtype of true (true)
-	type boolean & false & false[1] (boolean) is not a subtype of true (true)
-	type boolean & false & false[2] (false) is not a subtype of true (true))",
-            toString(result.errors[0]));
+    if (!FFlag::DebugLuauForceOldSolver)
+    {
+        const std::string expected = FFlag::LuauNewTypePathErrorMessages
+                                         ? "Expected this to be 'true', but got 'boolean & false & false'; \n"
+                                           "this is because \n\t"
+                                           " * `boolean` is not a subtype of `true`\n\t"
+                                           " * `false` is not a subtype of `true`"
+                                         : "Expected this to be 'true', but got 'boolean & false & false'; \n"
+                                           "this is because \n\t"
+                                           " * the 1st component of the intersection is `false`, which is not a subtype of `true`\n\t"
+                                           " * the 2nd component of the intersection is `boolean`, which is not a subtype of `true`\n\t"
+                                           " * the 3rd component of the intersection is `false`, which is not a subtype of `true`";
+        CHECK_EQ(expected, toString(result.errors[0]));
+    }
     else
-        CHECK_EQ(toString(result.errors[0]),
-            "Type 'boolean & false & false' could not be converted into 'true'; none of the intersection parts are compatible");
+        CHECK_EQ(
+            toString(result.errors[0]), "Expected this to be 'true', but got 'boolean & false & false'; none of the intersection parts are compatible"
+        );
 }
 
 TEST_CASE_FIXTURE(Fixture, "intersect_saturate_overloaded_functions")
 {
+    ScopedFastFlag _{FFlag::LuauDropUnionSubtypeReasoning, true};
+
     CheckResult result = check(R"(
         function foo(x: ((number?) -> number?) & ((string?) -> string?))
             local y : (nil) -> nil = x -- Not OK (fixed in DCR)
             local z : (number) -> number = x -- Not OK
         end
     )");
-    if (FFlag::DebugLuauDeferredConstraintResolution)
+
+    if (!FFlag::DebugLuauForceOldSolver)
     {
-        LUAU_REQUIRE_ERROR_COUNT(2, result);
-        const std::string expected1 = R"(Type
-    '(nil) -> nil'
-could not be converted into
-    '((number?) -> number?) & ((string?) -> string?)'; type (nil) -> nil.arguments()[0] (nil) is not a supertype of ((number?) -> number?) & ((string?) -> string?)[0].arguments()[0][0] (number)
-	type (nil) -> nil.arguments()[0] (nil) is not a supertype of ((number?) -> number?) & ((string?) -> string?)[1].arguments()[0][0] (string))";
-        const std::string expected2 = R"(Type
-    '(number) -> number'
-could not be converted into
-    '((number?) -> number?) & ((string?) -> string?)'; type (number) -> number.arguments()[0] (number) is not a supertype of ((number?) -> number?) & ((string?) -> string?)[0].arguments()[0][1] (nil)
-	type (number) -> number.arguments()[0] (number) is not a supertype of ((number?) -> number?) & ((string?) -> string?)[1].arguments()[0][0] (string)
-	type (number) -> number.arguments()[0] (number) is not a supertype of ((number?) -> number?) & ((string?) -> string?)[1].arguments()[0][1] (nil)
-	type (number) -> number.returns()[0] (number) is not a subtype of ((number?) -> number?) & ((string?) -> string?)[1].returns()[0] (string?))";
-        CHECK_EQ(expected1, toString(result.errors[0]));
-        CHECK_EQ(expected2, toString(result.errors[1]));
+        // clang-format off
+        const std::string expected1 = FFlag::LuauNewTypePathErrorMessages
+            ?
+                "Expected this to be\n"
+                "\t'(nil) -> nil'\n"
+                "but got\n"
+                "\t'((number?) -> number?) & ((string?) -> string?)'; \n"
+                "this is because \n"
+                "\t * Expected the return type to be `nil`, but got `number`\n"
+                "\t * Expected the return type to be `nil`, but got `string`"
+            :
+                "Expected this to be\n"
+                "\t'(nil) -> nil'\n"
+                "but got\n"
+                "\t'((number?) -> number?) & ((string?) -> string?)'; \n"
+                "this is because \n"
+                "\t * in the 1st component of the intersection, the function returns the 1st entry in the type pack which has the 1st component of the union as `number` and it returns the 1st entry in the type pack is `nil`, and `number` is not a subtype of `nil`\n"
+                "\t * in the 2nd component of the intersection, the function returns the 1st entry in the type pack which has the 1st component of the union as `string` and it returns the 1st entry in the type pack is `nil`, and `string` is not a subtype of `nil`"
+        ;
+        const std::string expected2 = FFlag::LuauNewTypePathErrorMessages
+            ?
+                "Expected this to be\n"
+                "\t'(number) -> number'\n"
+                "but got\n"
+                "\t'((number?) -> number?) & ((string?) -> string?)'; \n"
+                "this is because \n"
+                "\t * Expected the 1st parameter to be a supertype of `number`, but got `string?`\n"
+                "\t * Expected the return type to be `number`, but got `nil`\n"
+                "\t * Expected the return type to be `number`, but got `string`"
+            :
+                "Expected this to be\n"
+                "	'(number) -> number'\n"
+                "but got\n"
+                "	'((number?) -> number?) & ((string?) -> string?)';\n"
+                "this is because\n"
+                "	 * in the 1st component of the intersection, the function returns the 1st entry in the type pack which has the 2nd component of the union as `nil` and it returns the 1st entry in the type pack is `number`, and `nil` is not a subtype of `number`\n"
+                "	 * in the 2nd component of the intersection, the function returns the 1st entry in the type pack which has the 1st component of the union as `string` and it returns the 1st entry in the type pack is `number`, and `string` is not a subtype of `number`\n"
+                "	 * in the 2nd component of the intersection, the function returns the 1st entry in the type pack which has the 2nd component of the union as `nil` and it returns the 1st entry in the type pack is `number`, and `nil` is not a subtype of `number`\n"
+                "	 * in the 2nd component of the intersection, the function takes the 1st entry in the type pack which is `string?` and it takes the 1st entry in the type pack is `number`, and `string?` is not a supertype of `number`"
+        ;
+        // clang-format on
+
+        CHECK_LONG_STRINGS_EQ(expected1, toString(result.errors.at(0)));
+        CHECK_LONG_STRINGS_EQ(expected2, toString(result.errors.at(1)));
     }
     else
     {
         LUAU_REQUIRE_ERROR_COUNT(1, result);
-        const std::string expected = R"(Type
-    '((number?) -> number?) & ((string?) -> string?)'
-could not be converted into
-    '(number) -> number'; none of the intersection parts are compatible)";
+        const std::string expected = R"(Expected this to be
+	'(number) -> number'
+but got
+	'((number?) -> number?) & ((string?) -> string?)'; none of the intersection parts are compatible)";
         CHECK_EQ(expected, toString(result.errors[0]));
     }
 }
 
 TEST_CASE_FIXTURE(Fixture, "union_saturate_overloaded_functions")
 {
+    // CLI-116474 Semantic subtyping of assignments needs to decide how to interpret intersections of functions
+    DOES_NOT_PASS_NEW_SOLVER_GUARD();
+
     CheckResult result = check(R"(
         function f(x: ((number) -> number) & ((string) -> string))
             local y : ((number | string) -> (number | string)) = x -- OK
@@ -575,10 +663,12 @@ TEST_CASE_FIXTURE(Fixture, "union_saturate_overloaded_functions")
     )");
 
     LUAU_REQUIRE_ERROR_COUNT(1, result);
-    const std::string expected = R"(Type
-    '((number) -> number) & ((string) -> string)'
-could not be converted into
-    '(boolean | number) -> boolean | number'; none of the intersection parts are compatible)";
+
+    const std::string expected = "Expected this to be\n\t"
+                                 "'(boolean | number) -> boolean | number'"
+                                 "\nbut got\n\t"
+                                 "'((number) -> number) & ((string) -> string)'"
+                                 "; none of the intersection parts are compatible";
     CHECK_EQ(expected, toString(result.errors[0]));
 }
 
@@ -592,21 +682,34 @@ TEST_CASE_FIXTURE(Fixture, "intersection_of_tables")
     )");
 
     LUAU_REQUIRE_ERROR_COUNT(1, result);
-    const std::string expected = (FFlag::DebugLuauDeferredConstraintResolution)
-                                     ? "Type "
-                                       "'{ p: number?, q: number?, r: number? } & { p: number?, q: string? }'"
-                                       " could not be converted into "
-                                       "'{ p: nil }'; none of the intersection parts are compatible"
-                                     :
-                                     R"(Type
-    '{| p: number?, q: number?, r: number? |} & {| p: number?, q: string? |}'
-could not be converted into
-    '{| p: nil |}'; none of the intersection parts are compatible)";
-    CHECK_EQ(expected, toString(result.errors[0]));
+
+    if (!FFlag::DebugLuauForceOldSolver)
+    {
+        const std::string expected =
+            FFlag::LuauNewTypePathErrorMessages
+                ? "Expected this to be '{ p: nil }', but got '{ p: number?, q: number?, r: number? } & { p: number?, q: string? }'"
+                  "; \n"
+                  "Expected property `p` to be exactly `nil`, but got `number`"
+                : "Expected this to be '{ p: nil }', but got '{ p: number?, q: number?, r: number? } & { p: number?, q: string? }'"
+                  "; \nthis is because \n\t"
+                  " * in the 1st component of the intersection, accessing `p` has the 1st component of the union as `number` and "
+                  "accessing `p` results in `nil`, and `number` is not exactly `nil`\n\t"
+                  " * in the 2nd component of the intersection, accessing `p` has the 1st component of the union as `number` and "
+                  "accessing `p` results in `nil`, and `number` is not exactly `nil`";
+        CHECK_EQ(expected, toString(result.errors[0]));
+    }
+    else
+    {
+        const std::string expected =
+            R"(Expected this to be '{ p: nil }', but got '{ p: number?, q: number?, r: number? } & { p: number?, q: string? }'; none of the intersection parts are compatible)";
+        CHECK_EQ(expected, toString(result.errors[0]));
+    }
 }
 
 TEST_CASE_FIXTURE(Fixture, "intersection_of_tables_with_top_properties")
 {
+    ScopedFastFlag _{FFlag::LuauDropUnionSubtypeReasoning, true};
+
     CheckResult result = check(R"(
         function f(x : { p : number?, q : any } & { p : unknown, q : string? })
             local y : { p : number?, q : string? } = x -- OK
@@ -614,39 +717,46 @@ TEST_CASE_FIXTURE(Fixture, "intersection_of_tables_with_top_properties")
         end
     )");
 
-    if (FFlag::DebugLuauDeferredConstraintResolution)
+    if (!FFlag::DebugLuauForceOldSolver)
     {
-        LUAU_REQUIRE_ERROR_COUNT(2, result);
+        // clang-format off
+        const std::string expected = FFlag::LuauNewTypePathErrorMessages
+            ?
+                "Expected this to be\n"
+                "\t'{ p: string?, q: number? }'\n"
+                "but got\n"
+                "\t'{ p: number?, q: any } & { p: unknown, q: string? }'; \n"
+                "this is because \n"
+                "\t * Expected property `p` to be exactly `string?`, but got `number`\n"
+                "\t * Expected property `p` to be exactly `string?`, but got `unknown`\n"
+                "\t * Expected property `p` to be exactly `string`, but got `number?`\n"
+                "\t * Expected property `q` to be exactly `number?`, but got `any`\n"
+                "\t * Expected property `q` to be exactly `number?`, but got `string`\n"
+                "\t * Expected property `q` to be exactly `number`, but got `string?`"
+            :
+                "Expected this to be\n"
+                "\t'{ p: string?, q: number? }'\n"
+                "but got\n"
+                "\t'{ p: number?, q: any } & { p: unknown, q: string? }'; \n"
+                "this is because \n"
+                "\t* in the 1st component of the intersection, accessing `p` has the 1st component of the union as `number` and accessing `p` results in `string?`, and `number` is not exactly `string?`\n"
+                "\t* in the 1st component of the intersection, accessing `p` results in `number?` and accessing `p` has the 1st component of the union as `string`, and `number?` is not exactly `string`\n"
+                "\t* in the 1st component of the intersection, accessing `q` results in `any` and accessing `q` results in `number?`, and `any` is not exactly `number?`\n"
+                "\t* in the 2nd component of the intersection, accessing `p` results in `unknown` and accessing `p` results in `string?`, and `unknown` is not exactly `string?`\n"
+                "\t* in the 2nd component of the intersection, accessing `q` has the 1st component of the union as `string` and accessing `q` results in `number?`, and `string` is not exactly `number?`\n"
+                "\t* in the 2nd component of the intersection, accessing `q` results in `string?` and accessing `q` has the 1st component of the union as `number`, and `string?` is not exactly `number`"
+        ;
+        // clang-format on
 
-        CHECK_EQ(
-            toString(result.errors[0]),
-            "Type '{| p: number?, q: string? |}' could not be converted into '{| p: string?, q: number? |}'\n"
-            "caused by:\n"
-            "  Property 'p' is not compatible. Type 'number?' could not be converted into 'string?'\n"
-            "caused by:\n"
-            "  Not all union options are compatible. Type 'number' could not be converted into 'string?'\n"
-            "caused by:\n"
-            "  None of the union options are compatible. For example: Type 'number' could not be converted into 'string' in an invariant context"
-        );
-
-        CHECK_EQ(
-            toString(result.errors[1]),
-            "Type '{| p: number?, q: string? |}' could not be converted into '{| p: string?, q: number? |}'\n"
-            "caused by:\n"
-            "  Property 'q' is not compatible. Type 'string?' could not be converted into 'number?'\n"
-            "caused by:\n"
-            "  Not all union options are compatible. Type 'string' could not be converted into 'number?'\n"
-            "caused by:\n"
-            "  None of the union options are compatible. For example: Type 'string' could not be converted into 'number' in an invariant context"
-        );
+        CHECK_LONG_STRINGS_EQ(expected, toString(result.errors.at(0)));
     }
     else
     {
         LUAU_REQUIRE_ERROR_COUNT(1, result);
-        const std::string expected = R"(Type
-    '{| p: number?, q: any |} & {| p: unknown, q: string? |}'
-could not be converted into
-    '{| p: string?, q: number? |}'; none of the intersection parts are compatible)";
+        const std::string expected = R"(Expected this to be
+	'{ p: string?, q: number? }'
+but got
+	'{ p: number?, q: any } & { p: unknown, q: string? }'; none of the intersection parts are compatible)";
         CHECK_EQ(expected, toString(result.errors[0]));
     }
 }
@@ -665,6 +775,8 @@ TEST_CASE_FIXTURE(Fixture, "intersection_of_tables_with_never_properties")
 
 TEST_CASE_FIXTURE(Fixture, "overloaded_functions_returning_intersections")
 {
+    ScopedFastFlag _{FFlag::LuauDropUnionSubtypeReasoning, true};
+
     CheckResult result = check(R"(
         function f(x : ((number?) -> ({ p : number } & { q : number })) & ((string?) -> ({ p : number } & { r : number })))
             local y : (nil) -> { p : number, q : number, r : number} = x -- OK
@@ -672,18 +784,81 @@ TEST_CASE_FIXTURE(Fixture, "overloaded_functions_returning_intersections")
         end
     )");
 
-    LUAU_REQUIRE_ERROR_COUNT(1, result);
-    const std::string expected = (FFlag::DebugLuauDeferredConstraintResolution) ?
-                                                                                R"(Type
-    '((number?) -> { p: number } & { q: number }) & ((string?) -> { p: number } & { r: number })'
-could not be converted into
-    '(number?) -> { p: number, q: number, r: number }'; none of the intersection parts are compatible)"
-                                                                                :
-                                                                                R"(Type
-    '((number?) -> {| p: number |} & {| q: number |}) & ((string?) -> {| p: number |} & {| r: number |})'
-could not be converted into
-    '(number?) -> {| p: number, q: number, r: number |}'; none of the intersection parts are compatible)";
-    CHECK_EQ(expected, toString(result.errors[0]));
+    if (!FFlag::DebugLuauForceOldSolver)
+    {
+        LUAU_REQUIRE_ERROR_COUNT(2, result);
+        const std::string expected1 =
+            FFlag::LuauNewTypePathErrorMessages
+                ? "Expected this to be\n\t"
+                  "'(nil) -> { p: number, q: number, r: number }'"
+                  "\nbut got\n\t"
+                  "'((number?) -> { p: number } & { q: number }) & ((string?) -> { p: number } & { r: number })'"
+                  "; \nthis is because \n\t"
+                  " * Expected the return type to be `{ p: number, q: number, r: number }`, but got `{ p: number }`\n\t"
+                  " * Expected the return type to be `{ p: number, q: number, r: number }`, but got `{ q: number }`\n\t"
+                  " * Expected the return type to be `{ p: number, q: number, r: number }`, but got `{ r: number }`"
+                : "Expected this to be\n"
+                  "	'(nil) -> { p: number, q: number, r: number }'\n"
+                  "but got\n"
+                  "	'((number?) -> { p: number } & { q: number }) & ((string?) -> { p: number } & { r: number })'; \n"
+                  "this is because \n"
+                  "	 * in the 1st component of the intersection, the function returns the 1st entry in the type pack which has the 1st component of "
+                  "the intersection as `{ p: number }` and it returns the 1st entry in the type pack is `{ p: number, q: number, r: number }`, and "
+                  "`{ p: number }` is not a subtype of `{ p: number, q: number, r: number }`\n"
+                  "	 * in the 1st component of the intersection, the function returns the 1st entry in the type pack which has the 2nd component of "
+                  "the intersection as `{ q: number }` and it returns the 1st entry in the type pack is `{ p: number, q: number, r: number }`, and "
+                  "`{ q: number }` is not a subtype of `{ p: number, q: number, r: number }`\n"
+                  "	 * in the 2nd component of the intersection, the function returns the 1st entry in the type pack which has the 1st component of "
+                  "the intersection as `{ p: number }` and it returns the 1st entry in the type pack is `{ p: number, q: number, r: number }`, and "
+                  "`{ p: number }` is not a subtype of `{ p: number, q: number, r: number }`\n"
+                  "	 * in the 2nd component of the intersection, the function returns the 1st entry in the type pack which has the 2nd component of "
+                  "the intersection as `{ r: number }` and it returns the 1st entry in the type pack is `{ p: number, q: number, r: number }`, and "
+                  "`{ r: number }` is not a subtype of `{ p: number, q: number, r: number }`";
+        const std::string expected2 =
+            FFlag::LuauNewTypePathErrorMessages
+                ? "Expected this to be\n\t"
+                  "'(number?) -> { p: number, q: number, r: number }'"
+                  "\nbut got\n\t"
+                  "'((number?) -> { p: number } & { q: number }) & ((string?) -> { p: number } & { r: number })'"
+                  "; \nthis is because \n\t"
+                  " * Expected the 1st parameter to be a supertype of `number`, but got `string?`\n\t"
+                  " * Expected the return type to be `{ p: number, q: number, r: number }`, but got `{ p: number }`\n\t"
+                  " * Expected the return type to be `{ p: number, q: number, r: number }`, but got `{ q: number }`\n\t"
+                  " * Expected the return type to be `{ p: number, q: number, r: number }`, but got `{ r: number }`"
+                : "Expected this to be\n"
+                  "\t'(number?) -> { p: number, q: number, r: number }'\n"
+                  "but got\n"
+                  "\t'((number?) -> { p: number } & { q: number }) & ((string?) -> { p: number } & { r: number })'; \n"
+                  "this is because \n"
+                  "\t* in the 1st component of the intersection, the function returns the 1st entry in the type pack which has the 1st component of "
+                  "the intersection as `{ p: number }` and it returns the 1st entry in the type pack is `{ p: number, q: number, r: number }`, and "
+                  "`{ p: number }` is not a subtype of `{ p: number, q: number, r: number }`\n"
+                  "\t* in the 1st component of the intersection, the function returns the 1st entry in the type pack which has the 2nd component of "
+                  "the intersection as `{ q: number }` and it returns the 1st entry in the type pack is `{ p: number, q: number, r: number }`, and "
+                  "`{ q: number }` is not a subtype of `{ p: number, q: number, r: number }`\n"
+                  "\t* in the 2nd component of the intersection, the function returns the 1st entry in the type pack which has the 1st component of "
+                  "the intersection as `{ p: number }` and it returns the 1st entry in the type pack is `{ p: number, q: number, r: number }`, and "
+                  "`{ p: number }` is not a subtype of `{ p: number, q: number, r: number }`\n"
+                  "\t* in the 2nd component of the intersection, the function returns the 1st entry in the type pack which has the 2nd component of "
+                  "the intersection as `{ r: number }` and it returns the 1st entry in the type pack is `{ p: number, q: number, r: number }`, and "
+                  "`{ r: number }` is not a subtype of `{ p: number, q: number, r: number }`\n"
+                  "\t* in the 2nd component of the intersection, the function takes the 1st entry in the type pack which is `string?` and it takes "
+                  "the 1st entry in the type pack has the 1st component of the union as `number`, and `string?` is not a supertype of `number`";
+
+        CHECK_LONG_STRINGS_EQ(expected1, toString(result.errors.at(0)));
+        CHECK_LONG_STRINGS_EQ(expected2, toString(result.errors.at(1)));
+    }
+    else
+    {
+        LUAU_REQUIRE_ERROR_COUNT(1, result);
+        CHECK_EQ(
+            R"(Expected this to be
+	'(number?) -> { p: number, q: number, r: number }'
+but got
+	'((number?) -> { p: number } & { q: number }) & ((string?) -> { p: number } & { r: number })'; none of the intersection parts are compatible)",
+            toString(result.errors[0])
+        );
+    }
 }
 
 TEST_CASE_FIXTURE(Fixture, "overloaded_functions_mentioning_generic")
@@ -696,13 +871,19 @@ TEST_CASE_FIXTURE(Fixture, "overloaded_functions_mentioning_generic")
             end
         end
     )");
-
-    LUAU_REQUIRE_ERROR_COUNT(1, result);
-    const std::string expected = R"(Type
-    '((number?) -> a | number) & ((string?) -> a | string)'
-could not be converted into
-    '(number?) -> a'; none of the intersection parts are compatible)";
-    CHECK_EQ(expected, toString(result.errors[0]));
+    if (!FFlag::DebugLuauForceOldSolver)
+    {
+        LUAU_REQUIRE_ERROR_COUNT(0, result);
+    }
+    else
+    {
+        LUAU_REQUIRE_ERROR_COUNT(1, result);
+        const std::string expected = R"(Expected this to be
+	'(number?) -> a'
+but got
+	'((number?) -> a | number) & ((string?) -> a | string)'; none of the intersection parts are compatible)";
+        CHECK_EQ(expected, toString(result.errors[0]));
+    }
 }
 
 TEST_CASE_FIXTURE(Fixture, "overloaded_functions_mentioning_generics")
@@ -716,12 +897,20 @@ TEST_CASE_FIXTURE(Fixture, "overloaded_functions_mentioning_generics")
         end
     )");
 
-    LUAU_REQUIRE_ERROR_COUNT(1, result);
-    const std::string expected = R"(Type
-    '((a?) -> a | b) & ((c?) -> b | c)'
-could not be converted into
-    '(a?) -> (a & c) | b'; none of the intersection parts are compatible)";
-    CHECK_EQ(expected, toString(result.errors[0]));
+
+    if (!FFlag::DebugLuauForceOldSolver)
+    {
+        LUAU_REQUIRE_NO_ERRORS(result);
+    }
+    else
+    {
+        LUAU_REQUIRE_ERROR_COUNT(1, result);
+        const std::string expected = R"(Expected this to be
+	'(a?) -> (a & c) | b'
+but got
+	'((a?) -> a | b) & ((c?) -> b | c)'; none of the intersection parts are compatible)";
+        CHECK_EQ(expected, toString(result.errors[0]));
+    }
 }
 
 TEST_CASE_FIXTURE(Fixture, "overloaded_functions_mentioning_generic_packs")
@@ -729,22 +918,98 @@ TEST_CASE_FIXTURE(Fixture, "overloaded_functions_mentioning_generic_packs")
     CheckResult result = check(R"(
         function f<a...,b...>()
             function g(x : ((number?, a...) -> (number?, b...)) & ((string?, a...) -> (string?, b...)))
-                local y : ((nil, a...) -> (nil, b...)) = x -- OK
+                local y : ((nil, a...) -> (nil, b...)) = x -- OK in the old solver, not OK in the new
                 local z : ((nil, b...) -> (nil, a...)) = x -- Not OK
+                local w : ((number?, a...) -> (number?, b...)) = x -- OK in both solvers
             end
         end
     )");
+    if (!FFlag::DebugLuauForceOldSolver)
+    {
+        LUAU_REQUIRE_ERROR_COUNT(2, result);
+        const TypeMismatch* tm1 = get<TypeMismatch>(result.errors[0]);
+        CHECK(tm1);
+        CHECK_EQ(toString(tm1->wantedType), "(nil, a...) -> (nil, b...)");
+        CHECK_EQ(toString(tm1->givenType), "((number?, a...) -> (number?, b...)) & ((string?, a...) -> (string?, b...))");
+        const TypeMismatch* tm2 = get<TypeMismatch>(result.errors[1]);
+        CHECK(tm2);
+        CHECK_EQ(toString(tm2->wantedType), "(nil, b...) -> (nil, a...)");
+        CHECK_EQ(toString(tm2->givenType), "((number?, a...) -> (number?, b...)) & ((string?, a...) -> (string?, b...))");
 
-    LUAU_REQUIRE_ERROR_COUNT(1, result);
-    const std::string expected = R"(Type
-    '((number?, a...) -> (number?, b...)) & ((string?, a...) -> (string?, b...))'
-could not be converted into
-    '(nil, b...) -> (nil, a...)'; none of the intersection parts are compatible)";
-    CHECK_EQ(expected, toString(result.errors[0]));
+        const std::string expected1 =
+            FFlag::LuauNewTypePathErrorMessages
+                ? "Expected this to be\n\t"
+                  "'(nil, a...) -> (nil, b...)'"
+                  "\nbut got\n\t"
+                  "'((number?, a...) -> (number?, b...)) & ((string?, a...) -> (string?, b...))'"
+                  "; \nthis is because \n\t"
+                  " * Expected the 1st return value to be `nil`, but got `number`\n\t"
+                  " * Expected the 1st return value to be `nil`, but got `string`"
+                : "Expected this to be\n\t"
+                  "'(nil, a...) -> (nil, b...)'"
+                  "\nbut got\n\t"
+                  "'((number?, a...) -> (number?, b...)) & ((string?, a...) -> (string?, b...))'"
+                  "; \nthis is because \n\t"
+                  " * in the 1st component of the intersection, the function returns the 1st entry in the type pack which has the 1st component of "
+                  "the "
+                  "union as `number` and it returns the 1st entry in the type pack is `nil`, and `number` is not a subtype of `nil`\n\t"
+                  " * in the 2nd component of the intersection, the function returns the 1st entry in the type pack which has the 1st component of "
+                  "the "
+                  "union as `string` and it returns the 1st entry in the type pack is `nil`, and `string` is not a subtype of `nil`";
+        const std::string expected2 =
+            FFlag::LuauNewTypePathErrorMessages
+                ? "Expected this to be\n\t"
+                  "'(nil, b...) -> (nil, a...)'"
+                  "\nbut got\n\t"
+                  "'((number?, a...) -> (number?, b...)) & ((string?, a...) -> (string?, b...))'"
+                  "; \nthis is because \n\t"
+                  " * Expected the 1st return value to be `nil`, but got `number`\n\t"
+                  " * Expected the 1st return value to be `nil`, but got `string`\n\t"
+                  " * Expected the parameter type pack tail to be a supertype of `b...`, but got `a...`\n\t"
+                  " * Expected the return type pack tail to be `a...`, but got `b...`"
+                : "Expected this to be\n\t"
+                  "'(nil, b...) -> (nil, a...)'"
+                  "\nbut got\n\t"
+                  "'((number?, a...) -> (number?, b...)) & ((string?, a...) -> (string?, b...))'"
+                  "; \nthis is because \n\t"
+                  " * in the 1st component of the intersection, the function returns a tail of `b...` and it returns a tail of `a...`, and `b...` is "
+                  "not a "
+                  "subtype of `a...`\n\t"
+                  " * in the 1st component of the intersection, the function returns the 1st entry in the type pack which has the 1st component of "
+                  "the "
+                  "union as `number` and it returns the 1st entry in the type pack is `nil`, and `number` is not a subtype of `nil`\n\t"
+                  " * in the 1st component of the intersection, the function takes a tail of `a...` and it takes a tail of `b...`, and `a...` is not "
+                  "a "
+                  "supertype of `b...`\n\t"
+                  " * in the 2nd component of the intersection, the function returns a tail of `b...` and it returns a tail of `a...`, and `b...` is "
+                  "not a "
+                  "subtype of `a...`\n\t"
+                  " * in the 2nd component of the intersection, the function returns the 1st entry in the type pack which has the 1st component of "
+                  "the "
+                  "union as `string` and it returns the 1st entry in the type pack is `nil`, and `string` is not a subtype of `nil`\n\t"
+                  " * in the 2nd component of the intersection, the function takes a tail of `a...` and it takes a tail of `b...`, and `a...` is not "
+                  "a "
+                  "supertype of `b...`";
+
+        CHECK_EQ(expected1, toString(result.errors[0]));
+        CHECK_EQ(expected2, toString(result.errors[1]));
+    }
+    else
+    {
+        LUAU_REQUIRE_ERROR_COUNT(1, result);
+        const std::string expected = R"(Expected this to be
+	'(nil, b...) -> (nil, a...)'
+but got
+	'((number?, a...) -> (number?, b...)) & ((string?, a...) -> (string?, b...))'; none of the intersection parts are compatible)";
+        CHECK_EQ(expected, toString(result.errors[0]));
+    }
 }
 
 TEST_CASE_FIXTURE(Fixture, "overloadeded_functions_with_unknown_result")
 {
+    // CLI-116474 Semantic subtyping of assignments needs to decide how to interpret intersections of functions
+    DOES_NOT_PASS_NEW_SOLVER_GUARD();
+
     CheckResult result = check(R"(
         function f<a...,b...>()
             function g(x : ((number) -> number) & ((nil) -> unknown))
@@ -755,15 +1020,20 @@ TEST_CASE_FIXTURE(Fixture, "overloadeded_functions_with_unknown_result")
     )");
 
     LUAU_REQUIRE_ERROR_COUNT(1, result);
-    const std::string expected = R"(Type
-    '((nil) -> unknown) & ((number) -> number)'
-could not be converted into
-    '(number?) -> number?'; none of the intersection parts are compatible)";
+
+    const std::string expected = "Expected this to be\n\t"
+                                 "'(number?) -> number?'"
+                                 "\nbut got\n\t"
+                                 "'((nil) -> unknown) & ((number) -> number)'"
+                                 "; none of the intersection parts are compatible";
     CHECK_EQ(expected, toString(result.errors[0]));
 }
 
 TEST_CASE_FIXTURE(Fixture, "overloadeded_functions_with_unknown_arguments")
 {
+    // CLI-116474 Semantic subtyping of assignments needs to decide how to interpret intersections of functions
+    DOES_NOT_PASS_NEW_SOLVER_GUARD();
+
     CheckResult result = check(R"(
         function f<a...,b...>()
             function g(x : ((number) -> number?) & ((unknown) -> string?))
@@ -774,10 +1044,12 @@ TEST_CASE_FIXTURE(Fixture, "overloadeded_functions_with_unknown_arguments")
     )");
 
     LUAU_REQUIRE_ERROR_COUNT(1, result);
-    const std::string expected = R"(Type
-    '((number) -> number?) & ((unknown) -> string?)'
-could not be converted into
-    '(number?) -> nil'; none of the intersection parts are compatible)";
+
+    const std::string expected = "Expected this to be\n\t"
+                                 "'(number?) -> nil'"
+                                 "\nbut got\n\t"
+                                 "'((number) -> number?) & ((unknown) -> string?)'"
+                                 "; none of the intersection parts are compatible";
     CHECK_EQ(expected, toString(result.errors[0]));
 }
 
@@ -792,12 +1064,65 @@ TEST_CASE_FIXTURE(Fixture, "overloadeded_functions_with_never_result")
     end
     )");
 
-    LUAU_REQUIRE_ERROR_COUNT(1, result);
-    const std::string expected = R"(Type
-    '((nil) -> never) & ((number) -> number)'
-could not be converted into
-    '(number?) -> never'; none of the intersection parts are compatible)";
-    CHECK_EQ(expected, toString(result.errors[0]));
+    if (!FFlag::DebugLuauForceOldSolver)
+    {
+        const std::string expected1 =
+            FFlag::LuauNewTypePathErrorMessages
+                ? "Expected this to be\n\t"
+                  "'(number?) -> number'"
+                  "\nbut got\n\t"
+                  "'((nil) -> never) & ((number) -> number)'"
+                  "; \nthis is because \n\t"
+                  " * Expected the 1st parameter to be a supertype of `nil`, but got `number`\n\t"
+                  " * Expected the 1st parameter to be a supertype of `number`, but got `nil`"
+                : "Expected this to be\n\t"
+                  "'(number?) -> number'"
+                  "\nbut got\n\t"
+                  "'((nil) -> never) & ((number) -> number)'"
+                  "; \nthis is because \n\t"
+                  " * in the 1st component of the intersection, the function takes the 1st entry in the type pack which is `number` and it takes the "
+                  "1st "
+                  "entry in the type pack has the 2nd component of the union as `nil`, and `number` is not a supertype of `nil`\n\t"
+                  " * in the 2nd component of the intersection, the function takes the 1st entry in the type pack which is `nil` and it takes the "
+                  "1st "
+                  "entry in the type pack has the 1st component of the union as `number`, and `nil` is not a supertype of `number`";
+        const std::string expected2 =
+            FFlag::LuauNewTypePathErrorMessages
+                ? "Expected this to be\n\t"
+                  "'(number?) -> never'"
+                  "\nbut got\n\t"
+                  "'((nil) -> never) & ((number) -> number)'"
+                  "; \nthis is because \n\t"
+                  " * Expected the 1st parameter to be a supertype of `nil`, but got `number`\n\t"
+                  " * Expected the 1st parameter to be a supertype of `number`, but got `nil`\n\t"
+                  " * Expected the return type to be `never`, but got `number`"
+                : "Expected this to be\n\t"
+                  "'(number?) -> never'"
+                  "\nbut got\n\t"
+                  "'((nil) -> never) & ((number) -> number)'"
+                  "; \nthis is because \n\t"
+                  " * in the 1st component of the intersection, the function returns the 1st entry in the type pack which is `number` and it returns "
+                  "the "
+                  "1st entry in the type pack is `never`, and `number` is not a subtype of `never`\n\t"
+                  " * in the 1st component of the intersection, the function takes the 1st entry in the type pack which is `number` and it takes the "
+                  "1st "
+                  "entry in the type pack has the 2nd component of the union as `nil`, and `number` is not a supertype of `nil`\n\t"
+                  " * in the 2nd component of the intersection, the function takes the 1st entry in the type pack which is `nil` and it takes the "
+                  "1st "
+                  "entry in the type pack has the 1st component of the union as `number`, and `nil` is not a supertype of `number`";
+
+        CHECK_EQ(expected1, toString(result.errors[0]));
+        CHECK_EQ(expected2, toString(result.errors[1]));
+    }
+    else
+    {
+        LUAU_REQUIRE_ERROR_COUNT(1, result);
+        const std::string expected = R"(Expected this to be
+	'(number?) -> never'
+but got
+	'((nil) -> never) & ((number) -> number)'; none of the intersection parts are compatible)";
+        CHECK_EQ(expected, toString(result.errors[0]));
+    }
 }
 
 TEST_CASE_FIXTURE(Fixture, "overloadeded_functions_with_never_arguments")
@@ -811,16 +1136,80 @@ TEST_CASE_FIXTURE(Fixture, "overloadeded_functions_with_never_arguments")
         end
     )");
 
-    LUAU_REQUIRE_ERROR_COUNT(1, result);
-    const std::string expected = R"(Type
-    '((never) -> string?) & ((number) -> number?)'
-could not be converted into
-    '(number?) -> nil'; none of the intersection parts are compatible)";
-    CHECK_EQ(expected, toString(result.errors[0]));
+    if (!FFlag::DebugLuauForceOldSolver)
+    {
+        const std::string expected1 =
+            FFlag::LuauNewTypePathErrorMessages
+                ? "Expected this to be\n\t"
+                  "'(never) -> nil'"
+                  "\nbut got\n\t"
+                  "'((never) -> string?) & ((number) -> number?)'"
+                  "; \nthis is because \n\t"
+                  " * Expected the return type to be `nil`, but got `number`\n\t"
+                  " * Expected the return type to be `nil`, but got `string`"
+                : "Expected this to be\n\t"
+                  "'(never) -> nil'"
+                  "\nbut got\n\t"
+                  "'((never) -> string?) & ((number) -> number?)'"
+                  "; \nthis is because \n\t"
+                  " * in the 1st component of the intersection, the function returns the 1st entry in the type pack which has the 1st component of "
+                  "the "
+                  "union as `number` and it returns the 1st entry in the type pack is `nil`, and `number` is not a subtype of `nil`\n\t"
+                  " * in the 2nd component of the intersection, the function returns the 1st entry in the type pack which has the 1st component of "
+                  "the "
+                  "union as `string` and it returns the 1st entry in the type pack is `nil`, and `string` is not a subtype of `nil`";
+        const std::string expected2 =
+            FFlag::LuauNewTypePathErrorMessages
+                ? "Expected this to be\n\t"
+                  "'(number?) -> nil'"
+                  "\nbut got\n\t"
+                  "'((never) -> string?) & ((number) -> number?)'"
+                  "; \nthis is because \n\t"
+                  " * Expected the 1st parameter to be a supertype of `nil`, but got `never`\n\t"
+                  " * Expected the 1st parameter to be a supertype of `nil`, but got `number`\n\t"
+                  " * Expected the 1st parameter to be a supertype of `number`, but got `never`\n\t"
+                  " * Expected the return type to be `nil`, but got `number`\n\t"
+                  " * Expected the return type to be `nil`, but got `string`"
+                : "Expected this to be\n\t"
+                  "'(number?) -> nil'"
+                  "\nbut got\n\t"
+                  "'((never) -> string?) & ((number) -> number?)'"
+                  "; \nthis is because \n\t"
+                  " * in the 1st component of the intersection, the function returns the 1st entry in the type pack which has the 1st component of "
+                  "the "
+                  "union as `number` and it returns the 1st entry in the type pack is `nil`, and `number` is not a subtype of `nil`\n\t"
+                  " * in the 1st component of the intersection, the function takes the 1st entry in the type pack which is `number` and it takes the "
+                  "1st "
+                  "entry in the type pack has the 2nd component of the union as `nil`, and `number` is not a supertype of `nil`\n\t"
+                  " * in the 2nd component of the intersection, the function returns the 1st entry in the type pack which has the 1st component of "
+                  "the "
+                  "union as `string` and it returns the 1st entry in the type pack is `nil`, and `string` is not a subtype of `nil`\n\t"
+                  " * in the 2nd component of the intersection, the function takes the 1st entry in the type pack which is `never` and it takes the "
+                  "1st "
+                  "entry in the type pack has the 1st component of the union as `number`, and `never` is not a supertype of `number`\n\t"
+                  " * in the 2nd component of the intersection, the function takes the 1st entry in the type pack which is `never` and it takes the "
+                  "1st "
+                  "entry in the type pack has the 2nd component of the union as `nil`, and `never` is not a supertype of `nil`";
+
+        CHECK_EQ(expected1, toString(result.errors[0]));
+        CHECK_EQ(expected2, toString(result.errors[1]));
+    }
+    else
+    {
+        LUAU_REQUIRE_ERROR_COUNT(1, result);
+        const std::string expected = R"(Expected this to be
+	'(number?) -> nil'
+but got
+	'((never) -> string?) & ((number) -> number?)'; none of the intersection parts are compatible)";
+        CHECK_EQ(expected, toString(result.errors[0]));
+    }
 }
 
 TEST_CASE_FIXTURE(Fixture, "overloadeded_functions_with_overlapping_results_and_variadics")
 {
+    // CLI-116474 Semantic subtyping of assignments needs to decide how to interpret intersections of functions
+    DOES_NOT_PASS_NEW_SOLVER_GUARD();
+
     CheckResult result = check(R"(
         function f(x : ((string?) -> (string | number)) & ((number?) -> ...number))
             local y : ((nil) -> (number, number?)) = x -- OK
@@ -829,11 +1218,13 @@ TEST_CASE_FIXTURE(Fixture, "overloadeded_functions_with_overlapping_results_and_
     )");
 
     LUAU_REQUIRE_ERROR_COUNT(1, result);
-    const std::string expected = R"(Type
-    '((number?) -> (...number)) & ((string?) -> number | string)'
-could not be converted into
-    '(number | string) -> (number, number?)'; none of the intersection parts are compatible)";
-    CHECK_EQ(expected, toString(result.errors[0]));
+
+    const std::string expected = "Expected this to be\n\t"
+                                 "'(number | string) -> (number, number?)'"
+                                 "\nbut got\n\t"
+                                 "'((number?) -> (...number)) & ((string?) -> number | string)'"
+                                 "; none of the intersection parts are compatible";
+    CHECK(expected == toString(result.errors[0]));
 }
 
 TEST_CASE_FIXTURE(Fixture, "overloadeded_functions_with_weird_typepacks_1")
@@ -847,11 +1238,18 @@ TEST_CASE_FIXTURE(Fixture, "overloadeded_functions_with_weird_typepacks_1")
         end
     )");
 
-    LUAU_REQUIRE_ERROR_COUNT(1, result);
-    CHECK_EQ(
-        toString(result.errors[0]),
-        "Type '(() -> (a...)) & (() -> (b...))' could not be converted into '() -> ()'; none of the intersection parts are compatible"
-    );
+    if (!FFlag::DebugLuauForceOldSolver)
+    {
+        LUAU_REQUIRE_NO_ERRORS(result);
+    }
+    else
+    {
+        LUAU_REQUIRE_ERROR_COUNT(1, result);
+        CHECK_EQ(
+            toString(result.errors[0]),
+            "Expected this to be '() -> ()', but got '(() -> (a...)) & (() -> (b...))'; none of the intersection parts are compatible"
+        );
+    }
 }
 
 TEST_CASE_FIXTURE(Fixture, "overloadeded_functions_with_weird_typepacks_2")
@@ -865,11 +1263,22 @@ TEST_CASE_FIXTURE(Fixture, "overloadeded_functions_with_weird_typepacks_2")
         end
     )");
 
-    LUAU_REQUIRE_ERROR_COUNT(1, result);
-    CHECK_EQ(
-        toString(result.errors[0]),
-        "Type '((a...) -> ()) & ((b...) -> ())' could not be converted into '() -> ()'; none of the intersection parts are compatible"
-    );
+    if (!FFlag::DebugLuauForceOldSolver)
+    {
+        LUAU_REQUIRE_ERROR_COUNT(1, result);
+        const TypeMismatch* tm = get<TypeMismatch>(result.errors[0]);
+        CHECK(tm);
+        CHECK_EQ(toString(tm->wantedType), "() -> ()");
+        CHECK_EQ(toString(tm->givenType), "((a...) -> ()) & ((b...) -> ())");
+    }
+    else
+    {
+        LUAU_REQUIRE_ERROR_COUNT(1, result);
+        CHECK_EQ(
+            toString(result.errors[0]),
+            "Expected this to be '() -> ()', but got '((a...) -> ()) & ((b...) -> ())'; none of the intersection parts are compatible"
+        );
+    }
 }
 
 TEST_CASE_FIXTURE(Fixture, "overloadeded_functions_with_weird_typepacks_3")
@@ -883,12 +1292,23 @@ TEST_CASE_FIXTURE(Fixture, "overloadeded_functions_with_weird_typepacks_3")
         end
     )");
 
-    LUAU_REQUIRE_ERROR_COUNT(1, result);
-    const std::string expected = R"(Type
-    '(() -> (a...)) & (() -> (number?, a...))'
-could not be converted into
-    '() -> number'; none of the intersection parts are compatible)";
-    CHECK_EQ(expected, toString(result.errors[0]));
+    if (!FFlag::DebugLuauForceOldSolver)
+    {
+        LUAU_REQUIRE_ERROR_COUNT(1, result);
+        const TypeMismatch* tm = get<TypeMismatch>(result.errors[0]);
+        CHECK(tm);
+        CHECK_EQ(toString(tm->wantedType), "() -> number");
+        CHECK_EQ(toString(tm->givenType), "(() -> (a...)) & (() -> (number?, a...))");
+    }
+    else
+    {
+        LUAU_REQUIRE_ERROR_COUNT(1, result);
+        const std::string expected = R"(Expected this to be
+	'() -> number'
+but got
+	'(() -> (a...)) & (() -> (number?, a...))'; none of the intersection parts are compatible)";
+        CHECK_EQ(expected, toString(result.errors[0]));
+    }
 }
 
 TEST_CASE_FIXTURE(Fixture, "overloadeded_functions_with_weird_typepacks_4")
@@ -903,16 +1323,64 @@ TEST_CASE_FIXTURE(Fixture, "overloadeded_functions_with_weird_typepacks_4")
     )");
 
     LUAU_REQUIRE_ERROR_COUNT(1, result);
-    const std::string expected = R"(Type
-    '((a...) -> ()) & ((number, a...) -> number)'
-could not be converted into
-    '(number?) -> ()'; none of the intersection parts are compatible)";
-    CHECK_EQ(expected, toString(result.errors[0]));
+
+    if (!FFlag::DebugLuauForceOldSolver)
+    {
+        const TypeMismatch* tm = get<TypeMismatch>(result.errors[0]);
+        CHECK(tm);
+        CHECK_EQ(toString(tm->wantedType), "(number?) -> ()");
+        CHECK_EQ(toString(tm->givenType), "((a...) -> ()) & ((number, a...) -> number)");
+        const std::string expected =
+            FFlag::LuauNewTypePathErrorMessages
+                ? "Expected this to be\n\t"
+                  "'(number?) -> ()'"
+                  "\nbut got\n\t"
+                  "'((a...) -> ()) & ((number, a...) -> number)'"
+                  "; \nthis is because \n\t"
+                  " * Expected the 1st parameter to be a supertype of `nil`, but got `number`\n\t"
+                  " * Expected the return types to be `()`, but got `number`\n\t"
+                  " * the parameter type pack tail is `a...` and the parameter types are `number?`, and `a...` is not a supertype of `number?`\n\t"
+                  " * the parameter type pack tail is `a...` and the parameters from the 1st onward are `number?`, and `a...` is not a supertype of "
+                  "`number?`"
+                : "Expected this to be\n\t"
+                  "'(number?) -> ()'"
+                  "\nbut got\n\t"
+                  "'((a...) -> ()) & ((number, a...) -> number)'"
+                  "; \nthis is because \n\t"
+                  " * in the 1st component of the intersection, the function takes a tail of `a...` and it takes the portion of the type pack "
+                  "starting at "
+                  "index 0 to the end`number?`, and `a...` is not a supertype of `number?`\n\t"
+                  " * in the 2nd component of the intersection, the function returns is `number` and it returns `()`, and `number` is not a subtype "
+                  "of "
+                  "`()`\n\t"
+                  " * in the 2nd component of the intersection, the function takes a tail of `a...` and it takes `number?`, and `a...` is not a "
+                  "supertype "
+                  "of `number?`\n\t"
+                  " * in the 2nd component of the intersection, the function takes the 1st entry in the type pack which is `number` and it takes the "
+                  "1st "
+                  "entry in the type pack has the 2nd component of the union as `nil`, and `number` is not a supertype of `nil`";
+
+        CHECK(expected == toString(result.errors[0]));
+    }
+    else
+    {
+        CHECK_EQ(
+            R"(Expected this to be
+	'(number?) -> ()'
+but got
+	'((a...) -> ()) & ((number, a...) -> number)'; none of the intersection parts are compatible)",
+            toString(result.errors[0])
+        );
+    }
 }
 
 TEST_CASE_FIXTURE(BuiltinsFixture, "intersect_metatables")
 {
-    if (FFlag::DebugLuauDeferredConstraintResolution)
+    // CLI-117121 - Intersection of types are not compatible with the equivalent alias
+    if (!FFlag::DebugLuauForceOldSolver)
+        return;
+
+    if (!FFlag::DebugLuauForceOldSolver)
     {
         CheckResult result = check(R"(
             function f(a: string?, b: string?)
@@ -1002,7 +1470,7 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "intersect_metatables_with_properties")
 
 TEST_CASE_FIXTURE(BuiltinsFixture, "intersect_metatable_with_table")
 {
-    if (FFlag::DebugLuauDeferredConstraintResolution)
+    if (!FFlag::DebugLuauForceOldSolver)
     {
         CheckResult result = check(R"(
             local x = setmetatable({ a = 5 }, { p = 5 })
@@ -1068,7 +1536,7 @@ TEST_CASE_FIXTURE(Fixture, "CLI-44817")
 
 TEST_CASE_FIXTURE(Fixture, "less_greedy_unification_with_intersection_types")
 {
-    if (!FFlag::DebugLuauDeferredConstraintResolution)
+    if (FFlag::DebugLuauForceOldSolver)
         return;
 
     CheckResult result = check(R"(
@@ -1078,15 +1546,18 @@ TEST_CASE_FIXTURE(Fixture, "less_greedy_unification_with_intersection_types")
         end
     )");
 
-    LUAU_REQUIRE_NO_ERRORS(result);
+    // We have one error here for the parameter being reduced to never, and
+    // then three bits of extra information indicating the three upper
+    // bound contributors: `{ x: number }`, `{ x: string }`, and `{ x: a }`
+    // from the function inference.
+    LUAU_REQUIRE_ERROR_COUNT(3, result);
 
-    // TODO? We do not simplify types from explicit annotations.
-    CHECK_EQ("({| x: number |} & {| x: string |}) -> {| x: number |} & {| x: string |}", toString(requireType("f")));
+    CHECK_EQ("(never) -> { x: number } & { x: string }", toString(requireType("f")));
 }
 
 TEST_CASE_FIXTURE(Fixture, "less_greedy_unification_with_intersection_types_2")
 {
-    if (!FFlag::DebugLuauDeferredConstraintResolution)
+    if (FFlag::DebugLuauForceOldSolver)
         return;
 
     CheckResult result = check(R"(
@@ -1132,7 +1603,7 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "index_property_table_intersection_2")
 
 TEST_CASE_FIXTURE(Fixture, "cli_80596_simplify_degenerate_intersections")
 {
-    ScopedFastFlag dcr{FFlag::DebugLuauDeferredConstraintResolution, true};
+    ScopedFastFlag dcr{FFlag::DebugLuauForceOldSolver, false};
 
     CheckResult result = check(R"(
         type A = {
@@ -1155,7 +1626,7 @@ TEST_CASE_FIXTURE(Fixture, "cli_80596_simplify_degenerate_intersections")
 
 TEST_CASE_FIXTURE(Fixture, "cli_80596_simplify_more_realistic_intersections")
 {
-    ScopedFastFlag dcr{FFlag::DebugLuauDeferredConstraintResolution, true};
+    ScopedFastFlag dcr{FFlag::DebugLuauForceOldSolver, false};
 
     CheckResult result = check(R"(
         type A = {
@@ -1176,6 +1647,46 @@ TEST_CASE_FIXTURE(Fixture, "cli_80596_simplify_more_realistic_intersections")
     )");
 
     LUAU_REQUIRE_NO_ERRORS(result);
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "narrow_intersection_nevers")
+{
+    ScopedFastFlag sffs{FFlag::DebugLuauForceOldSolver, false};
+
+    loadDefinition(R"(
+        declare extern type Player with
+            Character: unknown
+        end
+    )");
+    LUAU_REQUIRE_NO_ERRORS(check(R"(
+        local function foo(player: Player?)
+            if player and player.Character then
+                print(player.Character)
+            end
+        end
+    )"));
+
+    CHECK_EQ("Player & { read Character: ~(false?) }", toString(requireTypeAtPosition({3, 23})));
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "bounds_propagate_into_free_intersection_bounds")
+{
+    /*
+     * When unifying 'a <: T & C in a context where T is substituted for 't, we must constrain the lower bound of 't by 'a.
+     */
+    CheckResult result = check(R"(
+        local function f<T>(a: T & string): T
+            return a
+        end
+
+        local b = f("hello")
+        local c = f(("world" :: string))
+    )");
+
+    LUAU_CHECK_NO_ERRORS(result);
+
+    CHECK("string" == toString(requireType("b")));
+    CHECK("string" == toString(requireType("c")));
 }
 
 TEST_SUITE_END();

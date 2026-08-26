@@ -9,10 +9,24 @@
 namespace Luau
 {
 
+inline constexpr char kRequireTagName[] = "require";
+
 struct Frontend;
 struct GlobalTypes;
 struct TypeChecker;
 struct TypeArena;
+struct Subtyping;
+
+struct MagicRequire final : MagicFunction
+{
+    std::optional<WithPredicate<TypePackId>> handleOldSolver(
+        struct TypeChecker&,
+        const std::shared_ptr<struct Scope>&,
+        const class AstExprCall&,
+        WithPredicate<TypePackId>
+    ) override;
+    bool infer(const MagicFunctionCallContext& context) override;
+};
 
 void registerBuiltinGlobals(Frontend& frontend, GlobalTypes& globals, bool typeCheckForAutocomplete = false);
 TypeId makeUnion(TypeArena& arena, std::vector<TypeId>&& types);
@@ -62,14 +76,12 @@ TypeId makeFunction( // Polymorphic
     bool checked = false
 );
 
-void attachMagicFunction(TypeId ty, MagicFunction fn);
-void attachDcrMagicFunction(TypeId ty, DcrMagicFunction fn);
-void attachDcrMagicRefinement(TypeId ty, DcrMagicRefinement fn);
-
+void attachMagicFunction(TypeId ty, std::shared_ptr<MagicFunction> magic);
 Property makeProperty(TypeId ty, std::optional<std::string> documentationSymbol = std::nullopt);
 void assignPropDocumentationSymbols(TableType::Props& props, const std::string& baseName);
 
 std::string getBuiltinDefinitionSource();
+std::string getTypeFunctionDefinitionSource();
 
 void addGlobalBinding(GlobalTypes& globals, const std::string& name, TypeId ty, const std::string& packageName);
 void addGlobalBinding(GlobalTypes& globals, const std::string& name, Binding binding);
@@ -78,5 +90,18 @@ void addGlobalBinding(GlobalTypes& globals, const ScopePtr& scope, const std::st
 std::optional<Binding> tryGetGlobalBinding(GlobalTypes& globals, const std::string& name);
 Binding* tryGetGlobalBindingRef(GlobalTypes& globals, const std::string& name);
 TypeId getGlobalBinding(GlobalTypes& globals, const std::string& name);
+
+
+/** A number of built-in functions are magical enough that we need to match on them specifically by
+ * name when they are called. These are listed here to be used whenever necessary, instead of duplicating this logic repeatedly.
+ */
+
+bool matchSetMetatable(const AstExprCall& call);
+bool matchTableFreeze(const AstExprCall& call);
+bool matchAssert(const AstExprCall& call);
+bool matchTypeOf(const AstExprCall& call);
+
+// Returns `true` if the function should introduce typestate for its first argument.
+bool shouldTypestateForFirstArgument(const AstExprCall& call);
 
 } // namespace Luau

@@ -34,14 +34,15 @@ struct Builtin
     }
 };
 
-Builtin getBuiltin(AstExpr* node, const DenseHashMap<AstName, Global>& globals, const DenseHashMap<AstLocal*, Variable>& variables);
+Builtin getBuiltin(AstExpr* node, const DenseHashMap2<AstName, Global>& globals, const DenseHashMap2<AstLocal*, Variable>& variables);
 
 void analyzeBuiltins(
-    DenseHashMap<AstExprCall*, int>& result,
-    const DenseHashMap<AstName, Global>& globals,
-    const DenseHashMap<AstLocal*, Variable>& variables,
+    DenseHashMap2<AstExprCall*, int>& result,
+    const DenseHashMap2<AstName, Global>& globals,
+    const DenseHashMap2<AstLocal*, Variable>& variables,
     const CompileOptions& options,
-    AstNode* root
+    AstNode* root,
+    const AstNameTable& names
 );
 
 struct BuiltinInfo
